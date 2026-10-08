@@ -13,7 +13,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 )
 
-func TestManagementPanelLinksToCursorUsageWithoutChangingAsset(t *testing.T) {
+func TestManagementPanelServesNativeAssetWithoutInjectedLinks(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	dir := t.TempDir()
 	t.Setenv("MANAGEMENT_STATIC_PATH", dir)
@@ -27,8 +27,8 @@ func TestManagementPanelLinksToCursorUsageWithoutChangingAsset(t *testing.T) {
 	s.engine.GET("/management.html", s.serveManagementControlPanel)
 	w := httptest.NewRecorder()
 	s.engine.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/management.html", nil))
-	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `href="/cursor-usage.html"`) || !strings.Contains(w.Body.String(), "management app") {
-		t.Fatal("management panel did not expose the usage page")
+	if w.Code != http.StatusOK || w.Body.String() != original {
+		t.Fatal("management panel changed the native frontend asset")
 	}
 	unchanged, err := os.ReadFile(path)
 	if err != nil || string(unchanged) != original {

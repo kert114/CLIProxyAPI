@@ -4,10 +4,23 @@ This fork can read the allowance and spending for the account and team selected
 in Cursor CLI. It also covers usage through apps such as T3 Code that use that
 account. It does not attribute spending to individual apps or sessions.
 
-Start CLIProxyAPI with a management key configured, open `/management.html`, and
-choose **Cursor usage**. You can also open `/cursor-usage.html` directly. Enter
-the proxy management key and choose **Load usage**. **Refresh** fetches a new
-snapshot; there is no automatic polling.
+Start CLIProxyAPI with a management key configured, open `/management.html`, sign
+in normally, and choose **Quota Management**. The **Cursor account usage** card
+loads independently of auth files, including when there are no proxy credentials.
+Use its **Refresh Cursor usage** button or either dashboard refresh control to
+fetch a new snapshot. There is no automatic polling or separate key prompt.
+
+The native card requires the frontend from
+[the management panel fork](https://github.com/kert114/Cli-Proxy-API-Management-Center/tree/feat/native-cursor-quota).
+Build it with `bun install --frozen-lockfile` and `bun run build`, then copy
+`dist/index.html` to this proxy's `static/management.html` (or the directory set
+by `MANAGEMENT_STATIC_PATH`). Set `management.disable-auto-update-panel`
+to `true` in the local proxy config so the official panel updater does not replace
+the custom build. The generated HTML is a local artifact; frontend source lives
+in the linked repository.
+
+The older `/cursor-usage.html` page remains available directly as a fallback.
+It asks for the proxy management key and keeps it only in memory.
 
 The page shows included usage as a percentage, the reported Auto and other-model
 breakdown, personal on-demand spending in USD, the individual spending limit,
@@ -37,9 +50,12 @@ config fails the request rather than selecting another team silently.
 The endpoint is `GET /v8/management/observability/usage/cursor`. It requires the
 normal management key **and a direct loopback connection**, even when remote
 management is enabled. Forwarded IP headers do not satisfy this requirement.
-Keep the proxy bound to localhost for desktop use. The page keeps the management
-key only in memory and clears it on disconnect or reload. Responses are not
-cached and contain no Cursor token, email, or team identifier.
+Keep the proxy bound to localhost for desktop use. The native card uses the
+dashboard's existing management session and remember-password setting. Usage
+snapshots stay in memory and are cleared on logout or a connection change;
+pending requests are canceled. Responses are not cached and contain no Cursor
+token, email, or team identifier. This is an account monitor, not a proxy auth
+file or a Cursor inference provider.
 
 ## Upstream dependency
 

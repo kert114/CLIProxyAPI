@@ -149,7 +149,7 @@ see [MANAGEMENT_API.md](https://help.router-for.me/management/api)
 ## Usage Statistics
 
 This fork also provides [local Cursor account usage monitoring](docs/cursor-usage.md)
-through the **Cursor usage** link in the management panel.
+in **Quota Management** with the custom management panel build.
 
 Since v6.10.0, CLIProxyAPI and [CPAMC](https://github.com/router-for-me/Cli-Proxy-API-Management-Center) no longer ship built-in usage statistics. If you need usage statistics, use:
 
