@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Cursor usage | CLIProxyAPI</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #101114; color: #f0f1f3; }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    main { max-width: 1000px; margin: 0 auto; padding: 36px 24px 64px; }
+    a { color: #9cccb5; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    nav { display: flex; justify-content: space-between; gap: 20px; font-size: 14px; margin-bottom: 48px; }
+    h1 { margin: 0 0 12px; font-size: clamp(30px, 5vw, 42px); letter-spacing: -.04em; }
+    p { color: #a5a9b3; line-height: 1.6; }
+    .intro { margin: 0 0 32px; max-width: 650px; }
+    .panel { background: #191b20; border: 1px solid #30333b; border-radius: 12px; padding: 24px; }
+    label { display: block; font-size: 14px; margin-bottom: 10px; }
+    input, button { font: inherit; border-radius: 7px; padding: 11px 14px; border: 1px solid #454955; }
+    input { background: #101114; color: inherit; flex: 1; min-width: 160px; }
+    input:focus, button:focus-visible, a:focus-visible { outline: 2px solid #91cdb0; outline-offset: 3px; }
+    button { background: #9cccb5; color: #11251b; font-weight: 600; cursor: pointer; }
+    button:disabled { opacity: .6; cursor: wait; }
+    .row, .toolbar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+    .hint { font-size: 13px; margin-bottom: 0; }
+    .toolbar { margin: 28px 0 20px; justify-content: space-between; }
+    .toolbar p { margin: 0; font-size: 13px; }
+    .secondary { background: transparent; color: #a5a9b3; border-color: #454955; }
+    .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    h2 { margin: 0 0 18px; font-size: 14px; font-weight: 500; color: #a5a9b3; }
+    .value { font-size: 34px; font-weight: 650; letter-spacing: -.03em; }
+    .value small { font-size: 14px; font-weight: 400; color: #a5a9b3; }
+    .detail { font-size: 14px; margin: 14px 0 0; }
+    progress { display: block; width: 100%; height: 10px; margin-top: 20px; accent-color: #9cccb5; }
+    #error { color: #f2b3a8; border: 1px solid #80504b; background: #291d1d; border-radius: 8px; padding: 16px; margin: 20px 0; }
+    #warnings { color: #dbc48c; font-size: 13px; }
+    footer { color: #838995; font-size: 13px; line-height: 1.6; margin-top: 28px; }
+    [hidden] { display: none !important; }
+    @media (max-width: 620px) { main { padding: 24px 18px; } nav { margin-bottom: 36px; } .cards { grid-template-columns: 1fr; } .panel { padding: 20px; } .row button { width: 100%; } }
+  </style>
+</head>
+<body>
+<main>
+  <nav aria-label="Usage navigation"><a href="/management.html">Back to control panel</a><a href="https://cursor.com/dashboard?tab=usage" target="_blank" rel="noopener noreferrer">Cursor spending dashboard</a></nav>
+  <h1>Cursor usage</h1>
+  <p class="intro">See your account allowance and spending while you use Cursor through T3 Code.</p>
+  <form id="login" class="panel">
+    <label for="key">Proxy management key</label>
+    <div class="row"><input id="key" type="password" autocomplete="off" required placeholder="Enter your management key"><button id="connect" type="submit">Load usage</button></div>
+    <p class="hint">Uses the Cursor CLI account and selected team on this computer. Your management key stays in this tab and is cleared when you disconnect or reload.</p>
+  </form>
+  <div id="error" role="alert" hidden></div>
+  <section id="dashboard" aria-label="Cursor account usage" hidden>
+    <div class="toolbar"><p id="checked" aria-live="polite"></p><div class="row"><button id="refresh" type="button">Refresh</button><button id="disconnect" type="button" class="secondary">Disconnect</button></div></div>
+    <div id="cards" class="cards">
+      <article class="panel"><h2>Included usage</h2><div id="included" class="value"></div><progress id="meter" max="100" value="0" aria-label="Included usage consumed"></progress><p id="breakdown" class="detail"></p></article>
+      <article class="panel"><h2>On-demand spending</h2><div id="spend" class="value"></div><p id="limit" class="detail"></p></article>
+      <article class="panel"><h2>Current plan</h2><div id="plan" class="value"></div><p class="detail">Cursor account totals</p></article>
+      <article class="panel"><h2>Allowance resets</h2><div id="reset" class="value" style="font-size:24px"></div><p id="reset-time" class="detail"></p></article>
+    </div>
+    <p id="warnings" role="status" hidden></p>
+  </section>
+  <footer>Figures cover your Cursor account across apps. Refresh checks the account without starting an agent or changing your spending limits.</footer>
+</main>
+<script>
+  const el = id => document.getElementById(id);
+  const currency = value => new Intl.NumberFormat(undefined, {style: 'currency', currency: 'USD'}).format(value);
+  const percent = value => new Intl.NumberFormat(undefined, {maximumFractionDigits: 1}).format(value) + '%';
+  let managementKey = '';
+  let currentRequest = null;
+  const text = (id, value) => { el(id).textContent = value; };
+
+  function showSnapshot(data) {
+    const used = data.included.percent_used;
+    text('included', used == null ? 'Not reported' : percent(used) + ' used');
+    el('meter').hidden = used == null;
+    if (used != null) el('meter').value = Math.min(100, Math.max(0, used));
+    const parts = [];
+    if (data.included.auto_percent_used != null) parts.push('Auto: ' + percent(data.included.auto_percent_used));
+    if (data.included.api_percent_used != null) parts.push('Other models: ' + percent(data.included.api_percent_used));
+    text('breakdown', parts.join(' · ') || 'No breakdown reported');
+    text('spend', data.on_demand ? currency(data.on_demand.used_usd) : 'Not reported');
+    let limit = 'Spending limit not reported';
+    if (data.on_demand) {
+      if (data.on_demand.limit_kind === 'fixed') limit = 'Your limit: ' + currency(data.on_demand.limit_usd);
+      if (data.on_demand.limit_kind === 'disabled') limit = 'On-demand usage is disabled';
+      if (data.on_demand.limit_kind === 'unlimited') limit = 'No fixed individual limit reported';
+    }
+    text('limit', limit);
+    text('plan', data.plan);
+    const reset = data.resets_at ? new Date(data.resets_at) : null;
+    text('reset', reset ? reset.toLocaleDateString(undefined, {month: 'short', day: 'numeric', year: 'numeric'}) : 'Not reported');
+    text('reset-time', reset ? reset.toLocaleTimeString(undefined, {hour: '2-digit', minute: '2-digit', timeZoneName: 'short'}) : 'Check the Cursor dashboard for your billing cycle');
+    text('checked', 'Checked ' + new Date(data.checked_at).toLocaleString());
+    const warnings = data.warnings || [];
+    text('warnings', warnings.join('. '));
+    el('warnings').hidden = warnings.length === 0;
+    el('cards').hidden = false;
+  }
+
+  async function loadUsage() {
+    if (currentRequest || !managementKey) return;
+    const request = new AbortController();
+    currentRequest = request;
+    el('connect').disabled = true;
+    el('refresh').disabled = true;
+    el('error').hidden = true;
+    try {
+      const response = await fetch('/v8/management/observability/usage/cursor', {
+        headers: {'Authorization': 'Bearer ' + managementKey}, cache: 'no-store', credentials: 'omit', signal: request.signal
+      });
+      const data = await response.json();
+      if (currentRequest !== request) return;
+      if (!response.ok) {
+        if (response.status === 401) {
+          managementKey = '';
+          el('login').hidden = false;
+          el('dashboard').hidden = true;
+        }
+        throw new Error(data.error || 'Cursor usage could not be fetched. Try refreshing later.');
+      }
+      el('login').hidden = true;
+      el('dashboard').hidden = false;
+      showSnapshot(data);
+    } catch (error) {
+      if (currentRequest !== request || error.name === 'AbortError') return;
+      text('error', error.message || 'Connection failed. Try refreshing later.');
+      el('error').hidden = false;
+      if (managementKey) {
+        el('login').hidden = true;
+        el('dashboard').hidden = false;
+        el('cards').hidden = true;
+        text('checked', 'Usage is unavailable');
+        el('warnings').hidden = true;
+      }
+    } finally {
+      if (currentRequest === request) {
+        currentRequest = null;
+        el('connect').disabled = false;
+        el('refresh').disabled = false;
+      }
+    }
+  }
+
+  el('login').addEventListener('submit', event => {
+    event.preventDefault();
+    if (currentRequest) return;
+    managementKey = el('key').value.trim();
+    el('key').value = '';
+    loadUsage();
+  });
+  el('refresh').addEventListener('click', loadUsage);
+  el('disconnect').addEventListener('click', () => {
+    if (currentRequest) currentRequest.abort();
+    currentRequest = null;
+    el('connect').disabled = false;
+    el('refresh').disabled = false;
+    managementKey = '';
+    el('key').value = '';
+    el('dashboard').hidden = true;
+    el('login').hidden = false;
+    el('error').hidden = true;
+    el('key').focus();
+  });
+</script>
+</body>
+</html>
