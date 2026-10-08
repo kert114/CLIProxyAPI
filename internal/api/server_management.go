@@ -334,5 +334,15 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 		}
 	}
 
-	c.File(filePath)
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		c.AbortWithStatus(http.StatusInternalServerError)
+		return
+	}
+	if s.managementRoutesEnabled.Load() {
+		const link = `<a id="cursor-usage-link" href="/cursor-usage.html" style="position:fixed;bottom:20px;right:20px;z-index:1000;padding:10px 16px;border:1px solid #454955;border-radius:8px;background:#191b20;color:#9cccb5;text-decoration:none;font:14px system-ui">Cursor usage</a>`
+		content = []byte(strings.Replace(string(content), "</body>", link+"</body>", 1))
+	}
+	c.Header("Cache-Control", "no-store")
+	c.Data(http.StatusOK, "text/html; charset=utf-8", content)
 }
