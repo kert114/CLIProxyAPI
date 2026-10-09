@@ -16,6 +16,14 @@ go build -o test-output ./cmd/server && rm test-output # Verify compile (REQUIRE
 ```
 - Common flags: `--config <path>`, `--tui`, `--standalone`, `--local-model`, `--no-browser`, `--oauth-callback-port <port>`
 
+## Git
+When a task changes files in this repository, land them on `main` before you stop:
+1. Commit the change. Leave secrets, credentials, and local config out of the commit.
+2. Push a branch and open a pull request into `main`.
+3. Merge that pull request.
+
+The task is done when those commits are on `main`.
+
 ## Config
 - Default config: `config.yaml` (template: `config.example.yaml`)
 - `.env` is auto-loaded from the working directory
