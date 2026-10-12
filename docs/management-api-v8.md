@@ -164,24 +164,40 @@ extensions retain their declared `/v0/management` routes.
 
 ## Local GitHub activity
 
-`GET /observability/github` returns read-only PR status and calendar activity for
-one repository. It requires the management key and a direct loopback connection;
-forwarded headers do not grant access. Install GitHub CLI and sign in with
-`gh auth login` as the same OS user that runs the proxy. Credentials remain in
-GitHub CLI's existing credential storage.
+`GET /observability/github` returns read-only PR status and calendar activity.
+It requires the management key and a direct loopback connection; forwarded
+headers do not grant access. Install GitHub CLI and sign in with `gh auth login`
+as the same OS user that runs the proxy. Credentials remain in GitHub CLI's
+existing credential storage.
 
-Supply `repository=owner/repository`, `since=<RFC3339 timestamp>` and
+Supply `account=kert114` for account-wide monitoring, or
+`repository=owner/repository` for a single repository. Account scope must match
+the authenticated GitHub CLI viewer. Supply `since=<RFC3339 timestamp>` and
 `until=<RFC3339 timestamp>`. The interval is start-inclusive and end-exclusive,
 with a maximum length of 367 days to cover leap years and local DST boundaries.
 The dashboard uses local calendar days, Monday-start weeks, calendar months
-and calendar years. Counts cover all
-contributors in the selected repository; commits are reachable from its default
-branch and filtered by commit time.
+and calendar years, and refreshes account activity once per minute.
+
+Account scope paginates all repositories accessible through ownership,
+collaboration or organization membership, including forks. Commit totals sum
+the viewer's authored commits on each repository's default branch; the same
+commit reachable in multiple repositories counts once per repository. PR and
+issue activity counts are authored by the viewer. Merged PR counts refer to the
+viewer's PRs merged in the period, regardless of who merged them. Reviewed PR
+counts use GitHub's contribution collection, which represents the latest
+submitted review per PR and requires `read:user` for private contributions.
+Open PRs combine involvement, owned repositories and requested reviews, with
+URL-based deduplication. Each search is capped by GitHub at 1,000 results; if
+any open search is truncated, `open_truncated=true` marks `open_count` as a
+lower bound. Single-repository counts continue to cover all contributors.
 
 The snapshot contains `open_count`, `created_count`, `merged_count`,
 `commit_count`, `open_prs`, `created_prs`, `commits`, `default_branch` and
-`checked_at`. Each list contains up to 100 items; counts come from GitHub's
-untruncated totals. PR entries include links, draft state, check status, review
-decision and mergeability. Empty repositories return no default branch and no
-commits. Responses are uncached and failed or partial upstream queries return a
-sanitized 503 with `code=github_unavailable`.
+`checked_at`. Account responses populate `account`, `repository_count`,
+`repositories`, `issue_count`, `issues`, `review_count` and `reviews`. Every
+activity item identifies its repository. Activity lists contain up to 100 items;
+repository inventory is fully paginated. The commit list samples up to 10
+commits per repository, sorts by date and caps the combined list at 100. PR entries include links, draft state,
+check status, review decision and mergeability. Empty repositories return no
+default branch and no commits. Successful responses are uncached; failed or
+partial upstream queries return a sanitized 503 with `code=github_unavailable`.
