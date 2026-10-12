@@ -32,6 +32,7 @@ type Commit struct {
 	Author     string `json:"author"`
 }
 type Snapshot struct {
+	Organization    string               `json:"organization,omitempty"`
 	Account         string               `json:"account,omitempty"`
 	RepositoryCount int                  `json:"repository_count"`
 	IssueCount      int                  `json:"issue_count"`

@@ -2,6 +2,7 @@ package githubactivity
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -95,5 +96,46 @@ func TestFetchAccountMarksTruncatedSearchAndRejectsStalledCursor(t *testing.T) {
 		if err != nil || !got.OpenTruncated || got.OpenCount != 1 {
 			t.Fatalf("expected honest lower bound: %+v, %v", got, err)
 		}
+	}
+}
+
+func TestFetchOrganizationScopesEveryActivitySource(t *testing.T) {
+	client := &Client{Run: func(_ context.Context, input []byte) ([]byte, error) {
+		if strings.Contains(string(input), "OrganizationScope") {
+			return []byte(`{"data":{"organization":{"login":"60xAI","id":"org-id","url":"https://github.com/60xAI"}}}`), nil
+		}
+		if strings.Contains(string(input), "AccountSummary") {
+			var request struct{ Variables map[string]any }
+			if json.Unmarshal(input, &request) != nil {
+				t.Fatal("invalid query payload")
+			}
+			for _, key := range []string{"created", "merged", "issues"} {
+				query, ok := request.Variables[key].(string)
+				if !ok || !strings.Contains(query, " org:60xAI ") {
+					t.Fatalf("%s search is not organization-scoped", key)
+				}
+			}
+			if request.Variables["organizationID"] != "org-id" {
+				t.Fatal("review scope missing")
+			}
+			return []byte(emptyAccountSummary), nil
+		}
+		if strings.Contains(string(input), "OrganizationRepositories") {
+			if !strings.Contains(string(input), `"organization":"60xAI"`) {
+				t.Fatal("inventory organization missing")
+			}
+			return []byte(`{"data":{"viewer":{"repositories":{"totalCount":1,"pageInfo":{"hasNextPage":false},"nodes":[{"nameWithOwner":"60xAI/app","url":"https://github.com/60xAI/app","defaultBranchRef":null}]}}}}`), nil
+		}
+		if !strings.Contains(string(input), "is:pr is:open org:60xAI") || strings.Contains(string(input), "involves:") {
+			t.Fatal("open PRs must cover the organization only")
+		}
+		return []byte(`{"data":{"search":{"issueCount":1,"pageInfo":{"hasNextPage":false},"nodes":[{"number":7,"url":"https://github.com/60xAI/app/pull/7","repository":{"nameWithOwner":"60xAI/app"}}]}}}`), nil
+	}}
+	got, err := client.FetchOrganization(context.Background(), "kert114", "60xai", time.Now().Add(-24*time.Hour), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Organization != "60xAI" || got.URL != "https://github.com/60xAI" || got.RepositoryCount != 1 || got.OpenCount != 1 {
+		t.Fatalf("wrong organization scope: %+v", got)
 	}
 }
