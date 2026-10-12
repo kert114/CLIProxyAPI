@@ -17,6 +17,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/buildinfo"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/cursorusage"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/githubactivity"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginstore"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
@@ -63,6 +64,7 @@ type Handler struct {
 	pluginStoreRateLimiter  *pluginstore.GitHubRateLimiter
 	pluginReleases          pluginReleaseCache
 	cursorUsageClient       *cursorusage.Client
+	githubActivityClient    *githubactivity.Client
 }
 
 type configReloadSnapshot struct {
@@ -76,14 +78,15 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 	envSecret = strings.TrimSpace(envSecret)
 
 	h := &Handler{
-		cfg:                 cfg,
-		configFilePath:      configFilePath,
-		failedAttempts:      make(map[string]*attemptInfo),
-		authManager:         manager,
-		tokenStore:          sdkAuth.GetTokenStore(),
-		allowRemoteOverride: envSecret != "",
-		envSecret:           envSecret,
-		cursorUsageClient:   cursorusage.NewClient(),
+		cfg:                  cfg,
+		configFilePath:       configFilePath,
+		failedAttempts:       make(map[string]*attemptInfo),
+		authManager:          manager,
+		tokenStore:           sdkAuth.GetTokenStore(),
+		allowRemoteOverride:  envSecret != "",
+		envSecret:            envSecret,
+		cursorUsageClient:    cursorusage.NewClient(),
+		githubActivityClient: githubactivity.NewClient(),
 	}
 	h.startAttemptCleanup()
 	return h
