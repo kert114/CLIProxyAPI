@@ -11,36 +11,46 @@ import (
 )
 
 type PullRequest struct {
-	Number    int    `json:"number"`
-	Title     string `json:"title"`
-	URL       string `json:"url"`
-	Author    string `json:"author"`
-	Draft     bool   `json:"draft"`
-	Review    string `json:"review"`
-	Checks    string `json:"checks"`
-	Mergeable string `json:"mergeable"`
-	State     string `json:"state"`
-	CreatedAt string `json:"created_at"`
+	Repository string `json:"repository"`
+	Number     int    `json:"number"`
+	Title      string `json:"title"`
+	URL        string `json:"url"`
+	Author     string `json:"author"`
+	Draft      bool   `json:"draft"`
+	Review     string `json:"review"`
+	Checks     string `json:"checks"`
+	Mergeable  string `json:"mergeable"`
+	State      string `json:"state"`
+	CreatedAt  string `json:"created_at"`
 }
 type Commit struct {
-	SHA    string `json:"sha"`
-	Title  string `json:"title"`
-	URL    string `json:"url"`
-	Date   string `json:"date"`
-	Author string `json:"author"`
+	Repository string `json:"repository"`
+	SHA        string `json:"sha"`
+	Title      string `json:"title"`
+	URL        string `json:"url"`
+	Date       string `json:"date"`
+	Author     string `json:"author"`
 }
 type Snapshot struct {
-	Repository    string        `json:"repository"`
-	URL           string        `json:"url"`
-	DefaultBranch string        `json:"default_branch"`
-	CheckedAt     string        `json:"checked_at"`
-	OpenCount     int           `json:"open_count"`
-	CreatedCount  int           `json:"created_count"`
-	MergedCount   int           `json:"merged_count"`
-	CommitCount   int           `json:"commit_count"`
-	OpenPRs       []PullRequest `json:"open_prs"`
-	CreatedPRs    []PullRequest `json:"created_prs"`
-	Commits       []Commit      `json:"commits"`
+	Account         string               `json:"account,omitempty"`
+	RepositoryCount int                  `json:"repository_count"`
+	IssueCount      int                  `json:"issue_count"`
+	ReviewCount     int                  `json:"review_count"`
+	OpenTruncated   bool                 `json:"open_truncated"`
+	Repositories    []RepositoryActivity `json:"repositories"`
+	Issues          []Issue              `json:"issues"`
+	Reviews         []Review             `json:"reviews"`
+	Repository      string               `json:"repository"`
+	URL             string               `json:"url"`
+	DefaultBranch   string               `json:"default_branch"`
+	CheckedAt       string               `json:"checked_at"`
+	OpenCount       int                  `json:"open_count"`
+	CreatedCount    int                  `json:"created_count"`
+	MergedCount     int                  `json:"merged_count"`
+	CommitCount     int                  `json:"commit_count"`
+	OpenPRs         []PullRequest        `json:"open_prs"`
+	CreatedPRs      []PullRequest        `json:"created_prs"`
+	Commits         []Commit             `json:"commits"`
 }
 type Client struct {
 	Run func(context.Context, []byte) ([]byte, error)
@@ -77,6 +87,7 @@ const query = `query($owner:String!, $name:String!, $since:GitTimestamp!, $until
 }`
 
 type githubPR struct {
+	Repository                                              struct{ NameWithOwner string }
 	Number                                                  int
 	Title, URL, ReviewDecision, Mergeable, State, CreatedAt string
 	IsDraft                                                 bool
@@ -90,6 +101,7 @@ type githubPR struct {
 
 func normalizePR(pr githubPR) PullRequest {
 	out := PullRequest{Number: pr.Number, Title: pr.Title, URL: pr.URL, Draft: pr.IsDraft, Review: pr.ReviewDecision, Mergeable: pr.Mergeable, State: pr.State, CreatedAt: pr.CreatedAt}
+	out.Repository = pr.Repository.NameWithOwner
 	if pr.Author != nil {
 		out.Author = pr.Author.Login
 	}

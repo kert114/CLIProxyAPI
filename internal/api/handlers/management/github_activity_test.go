@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -22,6 +23,28 @@ func TestGitHubActivityAcceptsCalendarYear(t *testing.T) {
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestGitHubActivityAcceptsAccountScope(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	h := &Handler{githubActivityClient: &githubactivity.Client{Run: func(_ context.Context, input []byte) ([]byte, error) {
+		if strings.Contains(string(input), "AccountSummary") {
+			return []byte(`{"data":{"viewer":{"login":"kert114","id":"person","url":"https://github.com/kert114","contributionsCollection":{"pullRequestReviewContributions":{"nodes":[]}}},"created":{"nodes":[]},"merged":{},"issues":{"nodes":[]}}}`), nil
+		}
+		if strings.Contains(string(input), "AccountRepositories") {
+			return []byte(`{"data":{"viewer":{"repositories":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}`), nil
+		}
+		return []byte(`{"data":{"search":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}`), nil
+	}}}
+	router := gin.New()
+	router.GET("/github", h.GetGitHubActivity)
+	req := httptest.NewRequest(http.MethodGet, "/github?account=kert114&since=2026-01-01T00:00:00Z&until=2027-01-01T00:00:00Z", nil)
+	req.RemoteAddr = "127.0.0.1:1234"
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"account":"kert114"`) {
 		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
 	}
 }
