@@ -172,8 +172,9 @@ GitHub CLI's existing credential storage.
 
 Supply `repository=owner/repository`, `since=<RFC3339 timestamp>` and
 `until=<RFC3339 timestamp>`. The interval is start-inclusive and end-exclusive,
-with a maximum length of eight days to cover local weeks across DST changes.
-The dashboard uses local calendar days and Monday-start weeks. Counts cover all
+with a maximum length of 367 days to cover leap years and local DST boundaries.
+The dashboard uses local calendar days, Monday-start weeks, calendar months
+and calendar years. Counts cover all
 contributors in the selected repository; commits are reachable from its default
 branch and filtered by commit time.
 

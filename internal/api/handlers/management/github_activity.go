@@ -22,11 +22,15 @@ func (h *Handler) GetGitHubActivity(c *gin.Context) {
 	repository := c.Query("repository")
 	since, errSince := time.Parse(time.RFC3339, c.Query("since"))
 	until, errUntil := time.Parse(time.RFC3339, c.Query("until"))
-	if !githubRepositoryPattern.MatchString(repository) || errSince != nil || errUntil != nil || !until.After(since) || until.Sub(since) > 8*24*time.Hour {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "A repository and a calendar window of up to eight days are required", "code": "github_invalid_request"})
+	if !githubRepositoryPattern.MatchString(repository) || errSince != nil || errUntil != nil || !until.After(since) || until.Sub(since) > 367*24*time.Hour {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "A repository and a calendar window of up to one calendar year are required", "code": "github_invalid_request"})
 		return
 	}
-	snapshot, errFetch := githubactivity.NewClient().Fetch(c.Request.Context(), repository, since, until)
+	client := h.githubActivityClient
+	if client == nil {
+		client = githubactivity.NewClient()
+	}
+	snapshot, errFetch := client.Fetch(c.Request.Context(), repository, since, until)
 	if errFetch != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "GitHub activity could not be fetched. Check gh auth status and repository access, then refresh.", "code": "github_unavailable"})
 		return
