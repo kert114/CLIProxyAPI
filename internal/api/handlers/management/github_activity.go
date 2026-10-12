@@ -22,9 +22,10 @@ func (h *Handler) GetGitHubActivity(c *gin.Context) {
 	}
 	repository := c.Query("repository")
 	account := c.Query("account")
+	organization := c.Query("organization")
 	since, errSince := time.Parse(time.RFC3339, c.Query("since"))
 	until, errUntil := time.Parse(time.RFC3339, c.Query("until"))
-	validScope := (account == "" && githubRepositoryPattern.MatchString(repository)) || (repository == "" && githubAccountPattern.MatchString(account))
+	validScope := (organization == "" && account == "" && githubRepositoryPattern.MatchString(repository)) || (repository == "" && githubAccountPattern.MatchString(account) && (organization == "" || githubAccountPattern.MatchString(organization)))
 	if !validScope || errSince != nil || errUntil != nil || !until.After(since) || until.Sub(since) > 367*24*time.Hour {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "An account or repository and a calendar window of up to one calendar year are required", "code": "github_invalid_request"})
 		return
@@ -35,7 +36,9 @@ func (h *Handler) GetGitHubActivity(c *gin.Context) {
 	}
 	var snapshot githubactivity.Snapshot
 	var errFetch error
-	if account != "" {
+	if organization != "" {
+		snapshot, errFetch = client.FetchOrganization(c.Request.Context(), account, organization, since, until)
+	} else if account != "" {
 		snapshot, errFetch = client.FetchAccount(c.Request.Context(), account, since, until)
 	} else {
 		snapshot, errFetch = client.Fetch(c.Request.Context(), repository, since, until)

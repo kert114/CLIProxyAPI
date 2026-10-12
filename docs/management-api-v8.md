@@ -170,6 +170,13 @@ headers do not grant access. Install GitHub CLI and sign in with `gh auth login`
 as the same OS user that runs the proxy. Credentials remain in GitHub CLI's
 existing credential storage.
 
+Supply `account=kert114&organization=60xAI` to monitor only the organization.
+The dashboard defaults to this scope. Open PRs cover all accessible organization
+repositories; created/merged PRs, issues, reviews and commits are the viewer's
+activity within that organization. Reviews use its organization ID; repository
+inventory queries the organization directly. Personal forks and other
+organizations are excluded. Organization responses also include `organization`.
+
 Supply `account=kert114` for account-wide monitoring, or
 `repository=owner/repository` for a single repository. Account scope must match
 the authenticated GitHub CLI viewer. Supply `since=<RFC3339 timestamp>` and

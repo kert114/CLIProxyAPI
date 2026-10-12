@@ -44,8 +44,8 @@ const accountPRFields = `fragment AccountPR on PullRequest {
  repository {nameWithOwner}
  commits(last:1) {nodes {commit {statusCheckRollup {state}}}}
 }`
-const accountSummaryQuery = `query AccountSummary($since:DateTime!, $until:DateTime!, $created:String!, $merged:String!, $issues:String!) {
- viewer {login id url contributionsCollection(from:$since,to:$until) {
+const accountSummaryQuery = `query AccountSummary($since:DateTime!, $until:DateTime!, $created:String!, $merged:String!, $issues:String!, $organizationID:ID) {
+ viewer {login id url contributionsCollection(from:$since,to:$until,organizationID:$organizationID) {
   totalPullRequestReviewContributions
   pullRequestReviewContributions(first:100) {nodes {pullRequestReview {
    url submittedAt pullRequest {title repository {nameWithOwner}}
@@ -55,17 +55,21 @@ const accountSummaryQuery = `query AccountSummary($since:DateTime!, $until:DateT
  merged:search(query:$merged,type:ISSUE,first:1) {issueCount}
  issues:search(query:$issues,type:ISSUE,first:100) {issueCount nodes {...on Issue {number title url state createdAt repository {nameWithOwner}}}}
 }` + accountPRFields
-const accountRepositoriesQuery = `query AccountRepositories($authorID:ID!, $since:GitTimestamp!, $until:GitTimestamp!, $cursor:String) {
- viewer {repositories(first:25,after:$cursor,affiliations:[OWNER,COLLABORATOR,ORGANIZATION_MEMBER],ownerAffiliations:[OWNER,COLLABORATOR,ORGANIZATION_MEMBER]) {
-  totalCount pageInfo {hasNextPage endCursor} nodes {
-   nameWithOwner url isFork defaultBranchRef {name target {...on Commit {
-    history(first:10,since:$since,until:$until,author:{id:$authorID}) {
-     totalCount nodes {oid messageHeadline url committedDate author {name}}
-    }
-   }}}
-  }
- }}
+const repositoryInventoryFields = `fragment RepositoryInventory on RepositoryConnection {
+ totalCount pageInfo {hasNextPage endCursor} nodes {
+  nameWithOwner url isFork defaultBranchRef {name target {...on Commit {
+   history(first:10,since:$since,until:$until,author:{id:$authorID}) {
+    totalCount nodes {oid messageHeadline url committedDate author {name}}
+   }
+  }}}
+ }
 }`
+const accountRepositoriesQuery = `query AccountRepositories($authorID:ID!, $since:GitTimestamp!, $until:GitTimestamp!, $cursor:String) {
+ viewer {repositories(first:25,after:$cursor,affiliations:[OWNER,COLLABORATOR,ORGANIZATION_MEMBER],ownerAffiliations:[OWNER,COLLABORATOR,ORGANIZATION_MEMBER]) {...RepositoryInventory}}
+}` + repositoryInventoryFields
+const organizationRepositoriesQuery = `query OrganizationRepositories($authorID:ID!, $since:GitTimestamp!, $until:GitTimestamp!, $cursor:String, $organization:String!) {
+ viewer:organization(login:$organization) {repositories(first:25,after:$cursor,ownerAffiliations:[OWNER]) {...RepositoryInventory}}
+}` + repositoryInventoryFields
 const accountOpenQuery = `query AccountOpen($search:String!, $cursor:String) {
  search(query:$search,type:ISSUE,first:100,after:$cursor) {issueCount pageInfo {hasNextPage endCursor} nodes {...AccountPR}}
 }` + accountPRFields
@@ -93,6 +97,30 @@ func (c *Client) request(ctx context.Context, query string, variables map[string
 }
 
 func (c *Client) FetchAccount(ctx context.Context, account string, since, until time.Time) (Snapshot, error) {
+	return c.fetchScope(ctx, account, "", since, until)
+}
+func (c *Client) FetchOrganization(ctx context.Context, account, organization string, since, until time.Time) (Snapshot, error) {
+	return c.fetchScope(ctx, account, organization, since, until)
+}
+func (c *Client) fetchScope(ctx context.Context, account, organization string, since, until time.Time) (Snapshot, error) {
+	var organizationID any
+	var organizationURL string
+	qualifier := ""
+	repositoriesQuery := accountRepositoriesQuery
+	if organization != "" {
+		var scope struct {
+			Organization *struct{ Login, ID, URL string }
+		}
+		if c.request(ctx, `query OrganizationScope($organization:String!) {organization(login:$organization) {login id url}}`, map[string]any{"organization": organization}, &scope) != nil || scope.Organization == nil || !strings.EqualFold(scope.Organization.Login, organization) {
+			return Snapshot{}, ErrUnavailable
+		}
+		organization = scope.Organization.Login
+		organizationID = scope.Organization.ID
+		organizationURL = scope.Organization.URL
+		qualifier = " org:" + scope.Organization.Login
+		repositoriesQuery = organizationRepositoriesQuery
+	}
+
 	end := until.Add(-time.Second).UTC().Format(time.RFC3339)
 	start := since.UTC().Format(time.RFC3339)
 	period := start + ".." + end
@@ -126,10 +154,10 @@ func (c *Client) FetchAccount(ctx context.Context, account string, since, until 
 		}
 	}
 	if c.request(ctx, accountSummaryQuery, map[string]any{
-		"since": start, "until": end,
-		"created": "is:pr author:" + account + " created:" + period + " sort:created-desc",
-		"merged":  "is:pr author:" + account + " merged:" + period,
-		"issues":  "is:issue author:" + account + " created:" + period + " sort:created-desc",
+		"since": start, "until": end, "organizationID": organizationID,
+		"created": "is:pr author:" + account + qualifier + " created:" + period + " sort:created-desc",
+		"merged":  "is:pr author:" + account + qualifier + " merged:" + period,
+		"issues":  "is:issue author:" + account + qualifier + " created:" + period + " sort:created-desc",
 	}, &summary) != nil || summary.Viewer == nil || !strings.EqualFold(summary.Viewer.Login, account) {
 		return Snapshot{}, ErrUnavailable
 	}
@@ -137,6 +165,10 @@ func (c *Client) FetchAccount(ctx context.Context, account string, since, until 
 		CreatedCount: summary.Created.IssueCount, MergedCount: summary.Merged.IssueCount, IssueCount: summary.Issues.IssueCount,
 		ReviewCount: summary.Viewer.ContributionsCollection.TotalPullRequestReviewContributions,
 		OpenPRs:     []PullRequest{}, CreatedPRs: []PullRequest{}, Commits: []Commit{}, Repositories: []RepositoryActivity{}, Issues: []Issue{}, Reviews: []Review{}}
+	if organization != "" {
+		out.Organization = organization
+		out.URL = organizationURL
+	}
 	for _, pr := range summary.Created.Nodes {
 		out.CreatedPRs = append(out.CreatedPRs, normalizePR(pr))
 	}
@@ -173,7 +205,11 @@ func (c *Client) FetchAccount(ctx context.Context, account string, since, until 
 				}
 			}
 		}
-		if c.request(ctx, accountRepositoriesQuery, map[string]any{"authorID": summary.Viewer.ID, "since": start, "until": end, "cursor": cursor}, &page) != nil || page.Viewer == nil {
+		variables := map[string]any{"authorID": summary.Viewer.ID, "since": start, "until": end, "cursor": cursor}
+		if organization != "" {
+			variables["organization"] = organization
+		}
+		if c.request(ctx, repositoriesQuery, variables, &page) != nil || page.Viewer == nil {
 			return Snapshot{}, ErrUnavailable
 		}
 		repos := page.Viewer.Repositories
@@ -199,12 +235,16 @@ func (c *Client) FetchAccount(ctx context.Context, account string, since, until 
 		cursor = repos.PageInfo.EndCursor
 	}
 	seen := map[string]bool{}
-	for _, filter := range []string{"involves:", "user:", "review-requested:"} {
+	filters := []string{"involves:" + account, "user:" + account, "review-requested:" + account}
+	if organization != "" {
+		filters = []string{"org:" + organization}
+	}
+	for _, filter := range filters {
 		cursor = nil
 		fetched := 0
 		for {
 			var page struct{ Search *prSearch }
-			if c.request(ctx, accountOpenQuery, map[string]any{"search": "is:pr is:open " + filter + account + " sort:updated-desc", "cursor": cursor}, &page) != nil || page.Search == nil {
+			if c.request(ctx, accountOpenQuery, map[string]any{"search": "is:pr is:open " + filter + " sort:updated-desc", "cursor": cursor}, &page) != nil || page.Search == nil {
 				return Snapshot{}, ErrUnavailable
 			}
 			for _, pr := range page.Search.Nodes {
