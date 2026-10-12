@@ -161,3 +161,26 @@ accepts legacy, new, or mixed layouts, normalizing v8 documents on save.
 
 Plugin OAuth uses the shared v8 login endpoint. Other plugin-defined HTTP
 extensions retain their declared `/v0/management` routes.
+
+## Local GitHub activity
+
+`GET /observability/github` returns read-only PR status and calendar activity for
+one repository. It requires the management key and a direct loopback connection;
+forwarded headers do not grant access. Install GitHub CLI and sign in with
+`gh auth login` as the same OS user that runs the proxy. Credentials remain in
+GitHub CLI's existing credential storage.
+
+Supply `repository=owner/repository`, `since=<RFC3339 timestamp>` and
+`until=<RFC3339 timestamp>`. The interval is start-inclusive and end-exclusive,
+with a maximum length of eight days to cover local weeks across DST changes.
+The dashboard uses local calendar days and Monday-start weeks. Counts cover all
+contributors in the selected repository; commits are reachable from its default
+branch and filtered by commit time.
+
+The snapshot contains `open_count`, `created_count`, `merged_count`,
+`commit_count`, `open_prs`, `created_prs`, `commits`, `default_branch` and
+`checked_at`. Each list contains up to 100 items; counts come from GitHub's
+untruncated totals. PR entries include links, draft state, check status, review
+decision and mergeability. Empty repositories return no default branch and no
+commits. Responses are uncached and failed or partial upstream queries return a
+sanitized 503 with `code=github_unavailable`.

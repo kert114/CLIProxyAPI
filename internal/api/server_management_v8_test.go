@@ -218,3 +218,42 @@ func TestManagementV8PluginOperationMigratesConfiguration(t *testing.T) {
 		t.Fatal("missing configuration reload")
 	}
 }
+
+func TestGitHubActivityIsLocalAndAuthenticated(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(configPath, []byte("remote-management: {secret-key: test-password}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.LoadConfig(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := management.NewHandler(cfg, "", nil)
+	h.SetLocalPassword("test-password")
+	s := &Server{cfg: cfg, engine: gin.New(), mgmt: h}
+	s.managementRoutesEnabled.Store(true)
+	s.registerManagementV8Routes()
+	for _, tc := range []struct {
+		name, remote, key string
+		want              int
+	}{
+		{"remote with forwarded loopback", "192.0.2.2:1234", "test-password", http.StatusForbidden},
+		{"local without key", "127.0.0.1:1234", "", http.StatusUnauthorized},
+		{"local invalid repository", "127.0.0.1:1234", "test-password", http.StatusBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/v8/management/observability/github?repository=bad", nil)
+			req.RemoteAddr = tc.remote
+			req.Header.Set("X-Forwarded-For", "127.0.0.1")
+			if tc.key != "" {
+				req.Header.Set("Authorization", "Bearer "+tc.key)
+			}
+			w := httptest.NewRecorder()
+			s.engine.ServeHTTP(w, req)
+			if w.Code != tc.want {
+				t.Fatalf("status=%d want=%d body=%s", w.Code, tc.want, w.Body.String())
+			}
+		})
+	}
+}
