@@ -256,3 +256,17 @@ func TestSnapshotCachePrunesExpiredFilesOnSave(t *testing.T) {
 		t.Fatalf("expired storage remained: files=%d memory=%d err=%v", len(files), len(cache.entries), err)
 	}
 }
+
+func TestSnapshotCacheReusesEquivalentCalendarTimezones(t *testing.T) {
+	cache := NewSnapshotCache(t.TempDir())
+	zone := time.FixedZone("local", 3600)
+	scope := SnapshotScope{Viewer: "person-id", Repository: "owner/repo", Since: time.Date(2026, 10, 12, 0, 0, 0, 0, zone), Until: time.Date(2026, 10, 19, 0, 0, 0, 0, zone)}
+	calls := 0
+	load := func(context.Context) (Snapshot, error) { calls++; return Snapshot{OpenCount: 4}, nil }
+	_, _ = cache.Fetch(context.Background(), scope, false, load)
+	scope.Since, scope.Until = scope.Since.UTC(), scope.Until.UTC()
+	_, err := cache.Fetch(context.Background(), scope, false, load)
+	if err != nil || calls != 1 {
+		t.Fatalf("equivalent calendar boundaries caused duplicate fetch: calls=%d err=%v", calls, err)
+	}
+}

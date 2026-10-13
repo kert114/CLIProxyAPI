@@ -62,6 +62,7 @@ func (c *SnapshotCache) Fetch(ctx context.Context, scope SnapshotScope, force bo
 	if errContext := ctx.Err(); errContext != nil {
 		return Snapshot{}, errContext
 	}
+	scope.Since, scope.Until = scope.Since.UTC(), scope.Until.UTC()
 	encoded, errEncode := json.Marshal(scope)
 	if errEncode != nil {
 		return Snapshot{}, ErrUnavailable
