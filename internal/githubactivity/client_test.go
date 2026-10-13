@@ -40,3 +40,13 @@ func TestFetchRejectsPartialAndFailedGitHubResponses(t *testing.T) {
 		})
 	}
 }
+
+func TestFetchIncludesPullRequestCreationAndUpdateDates(t *testing.T) {
+	client := &Client{Run: func(context.Context, []byte) ([]byte, error) {
+		return []byte(`{"data":{"repository":{"nameWithOwner":"owner/repo","pullRequests":{"totalCount":1,"nodes":[{"number":8,"createdAt":"2026-10-12T10:00:00Z","updatedAt":"2026-10-13T11:00:00Z","state":"OPEN"}]},"defaultBranchRef":null},"created":{"nodes":[]},"merged":{}}}`), nil
+	}}
+	got, err := client.Fetch(context.Background(), "owner/repo", time.Date(2026, 10, 12, 0, 0, 0, 0, time.UTC), time.Date(2026, 10, 14, 0, 0, 0, 0, time.UTC))
+	if err != nil || len(got.OpenPRs) != 1 || got.OpenPRs[0].CreatedAt != "2026-10-12T10:00:00Z" || got.OpenPRs[0].UpdatedAt != "2026-10-13T11:00:00Z" {
+		t.Fatalf("PR dates missing: snapshot=%+v err=%v", got, err)
+	}
+}
