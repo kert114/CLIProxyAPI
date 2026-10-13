@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -22,6 +24,7 @@ type PullRequest struct {
 	Mergeable  string `json:"mergeable"`
 	State      string `json:"state"`
 	CreatedAt  string `json:"created_at"`
+	UpdatedAt  string `json:"updated_at"`
 }
 type Commit struct {
 	Repository string `json:"repository"`
@@ -32,6 +35,8 @@ type Commit struct {
 	Author     string `json:"author"`
 }
 type Snapshot struct {
+	CacheStatus     string               `json:"cache_status,omitempty"`
+	RefreshError    bool                 `json:"refresh_error"`
 	Organization    string               `json:"organization,omitempty"`
 	Account         string               `json:"account,omitempty"`
 	RepositoryCount int                  `json:"repository_count"`
@@ -54,24 +59,52 @@ type Snapshot struct {
 	Commits         []Commit             `json:"commits"`
 }
 type Client struct {
-	Run func(context.Context, []byte) ([]byte, error)
+	Run   func(context.Context, []byte) ([]byte, error)
+	Cache *SnapshotCache
 }
 
 var ErrUnavailable = errors.New("GitHub activity unavailable")
 
 func NewClient() *Client {
-	return &Client{Run: func(ctx context.Context, input []byte) ([]byte, error) {
+	cacheDirectory := ""
+	if directory, errCache := os.UserCacheDir(); errCache == nil {
+		cacheDirectory = filepath.Join(directory, "CLIProxyAPI", "github-activity")
+	}
+	return &Client{Cache: NewSnapshotCache(cacheDirectory), Run: func(ctx context.Context, input []byte) ([]byte, error) {
 		cmd := exec.CommandContext(ctx, "gh", "api", "graphql", "--hostname", "github.com", "--input", "-")
 		cmd.Stdin = bytes.NewReader(input)
 		return cmd.Output()
 	}}
 }
 
+func (c *Client) FetchCached(ctx context.Context, scope SnapshotScope, force bool) (Snapshot, error) {
+	load := func(ctx context.Context) (Snapshot, error) {
+		if scope.Organization != "" {
+			return c.FetchOrganization(ctx, scope.Account, scope.Organization, scope.Since, scope.Until)
+		}
+		if scope.Account != "" {
+			return c.FetchAccount(ctx, scope.Account, scope.Since, scope.Until)
+		}
+		return c.Fetch(ctx, scope.Repository, scope.Since, scope.Until)
+	}
+	if c.Cache == nil {
+		return load(ctx)
+	}
+	var identity struct {
+		Viewer *struct{ ID, Login string }
+	}
+	if c.request(ctx, `query SnapshotViewer {viewer {id login}}`, nil, &identity) != nil || identity.Viewer == nil || identity.Viewer.ID == "" || (scope.Account != "" && !strings.EqualFold(scope.Account, identity.Viewer.Login)) {
+		return Snapshot{}, ErrUnavailable
+	}
+	scope.Viewer = identity.Viewer.ID
+	return c.Cache.Fetch(ctx, scope, force, load)
+}
+
 const query = `query($owner:String!, $name:String!, $since:GitTimestamp!, $until:GitTimestamp!, $created:String!, $merged:String!) {
  repository(owner:$owner,name:$name) {
   nameWithOwner url
   pullRequests(first:100,states:OPEN,orderBy:{field:UPDATED_AT,direction:DESC}) {
-   totalCount nodes { number title url isDraft reviewDecision mergeable author { login }
+   totalCount nodes { number title url state createdAt updatedAt isDraft reviewDecision mergeable author { login }
     commits(last:1) { nodes { commit { statusCheckRollup { state } } } }
    }
   }
@@ -82,18 +115,18 @@ const query = `query($owner:String!, $name:String!, $since:GitTimestamp!, $until
   } } }
  }
  created:search(query:$created,type:ISSUE,first:100) { issueCount nodes { ... on PullRequest {
-  number title url state createdAt isDraft author { login }
+  number title url state createdAt updatedAt isDraft author { login }
  } } }
  merged:search(query:$merged,type:ISSUE,first:1) { issueCount }
 }`
 
 type githubPR struct {
-	Repository                                              struct{ NameWithOwner string }
-	Number                                                  int
-	Title, URL, ReviewDecision, Mergeable, State, CreatedAt string
-	IsDraft                                                 bool
-	Author                                                  *struct{ Login string }
-	Commits                                                 struct {
+	Repository                                                         struct{ NameWithOwner string }
+	Number                                                             int
+	Title, URL, ReviewDecision, Mergeable, State, CreatedAt, UpdatedAt string
+	IsDraft                                                            bool
+	Author                                                             *struct{ Login string }
+	Commits                                                            struct {
 		Nodes []struct {
 			Commit struct{ StatusCheckRollup *struct{ State string } }
 		}
@@ -101,7 +134,7 @@ type githubPR struct {
 }
 
 func normalizePR(pr githubPR) PullRequest {
-	out := PullRequest{Number: pr.Number, Title: pr.Title, URL: pr.URL, Draft: pr.IsDraft, Review: pr.ReviewDecision, Mergeable: pr.Mergeable, State: pr.State, CreatedAt: pr.CreatedAt}
+	out := PullRequest{Number: pr.Number, Title: pr.Title, URL: pr.URL, Draft: pr.IsDraft, Review: pr.ReviewDecision, Mergeable: pr.Mergeable, State: pr.State, CreatedAt: pr.CreatedAt, UpdatedAt: pr.UpdatedAt}
 	out.Repository = pr.Repository.NameWithOwner
 	if pr.Author != nil {
 		out.Author = pr.Author.Login

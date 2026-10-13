@@ -205,6 +205,26 @@ The snapshot contains `open_count`, `created_count`, `merged_count`,
 activity item identifies its repository. Activity lists contain up to 100 items;
 repository inventory is fully paginated. The commit list samples up to 10
 commits per repository, sorts by date and caps the combined list at 100. PR entries include links, draft state,
-check status, review decision and mergeability. Empty repositories return no
-default branch and no commits. Successful responses are uncached; failed or
-partial upstream queries return a sanitized 503 with `code=github_unavailable`.
+check status, review decision, mergeability, creation date and update date. Empty
+repositories return no default branch and no commits.
+
+Successful snapshots are saved under the OS user cache directory in
+`CLIProxyAPI/github-activity`. The cache keeps at most 64 snapshots and 64 MiB
+of files. Files are private to the OS user on platforms with POSIX permissions.
+Snapshots are fresh for one minute. Supply `refresh=1` to request a fresh fetch;
+simultaneous requests for the same viewer, scope and exact calendar window share
+one fetch. A disconnected caller does not cancel a fetch another caller needs.
+
+Responses include `cache_status` as `fresh`, `refreshed` or `stale`, plus
+`refresh_error`. A failed or partial activity fetch can return the last successful
+snapshot for up to 24 hours with `cache_status=stale` and `refresh_error=true`.
+Its original `checked_at` remains unchanged. Automatic retries wait one minute
+after a failed refresh; an explicit refresh bypasses this backoff. The HTTP
+response remains `Cache-Control: no-store`.
+
+GitHub CLI must verify the current viewer before any cached snapshot is used.
+Snapshots from another viewer are never reused. If identity cannot be verified,
+or no usable snapshot exists, the response is a sanitized 503 with
+`code=github_unavailable`. The browser can retain its own prior snapshot during
+that error, but the server does not serve unverified cached data. Activity lists
+are samples; daily charts derived from those lists must indicate their coverage.

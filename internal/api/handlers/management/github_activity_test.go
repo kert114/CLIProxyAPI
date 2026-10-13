@@ -2,10 +2,12 @@ package management
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/githubactivity"
@@ -71,5 +73,65 @@ func TestGitHubActivityRejectsInvalidOrganizationScopes(t *testing.T) {
 		if w.Code != http.StatusBadRequest {
 			t.Fatalf("scope=%s status=%d", scope, w.Code)
 		}
+	}
+}
+
+func TestGitHubActivityCacheRefreshAndLoopbackBoundary(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	queries := 0
+	cache := githubactivity.NewSnapshotCache(t.TempDir())
+	client := &githubactivity.Client{Cache: cache, Run: func(_ context.Context, input []byte) ([]byte, error) {
+		if strings.Contains(string(input), "SnapshotViewer") {
+			return []byte(`{"data":{"viewer":{"id":"person-id","login":"person"}}}`), nil
+		}
+		queries++
+		payload := map[string]any{"data": map[string]any{"repository": map[string]any{"nameWithOwner": "owner/repo", "url": "https://github.com/owner/repo", "pullRequests": map[string]any{"totalCount": queries, "nodes": []any{}}, "defaultBranchRef": nil}, "created": map[string]any{"nodes": []any{}}, "merged": map[string]any{}}}
+		return json.Marshal(payload)
+	}}
+	h := &Handler{githubActivityClient: client}
+	router := gin.New()
+	router.GET("/github", h.GetGitHubActivity)
+	url := "/github?repository=owner/repo&since=2026-10-12T00:00:00Z&until=2026-10-13T00:00:00Z"
+	for index, suffix := range []string{"", "", "&refresh=1"} {
+		req := httptest.NewRequest(http.MethodGet, url+suffix, nil)
+		req.RemoteAddr = "127.0.0.1:1234"
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		var body githubactivity.Snapshot
+		if json.Unmarshal(w.Body.Bytes(), &body) != nil || w.Code != http.StatusOK || w.Header().Get("Cache-Control") != "no-store" {
+			t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+		}
+		want := 1
+		if index == 2 {
+			want = 2
+		}
+		if body.OpenCount != want || queries != want || body.CheckedAt == "" {
+			t.Fatalf("refresh request %d snapshot=%+v queries=%d", index, body, queries)
+		}
+	}
+	req := httptest.NewRequest(http.MethodGet, url, nil)
+	req.RemoteAddr = "203.0.113.8:1234"
+	req.Header.Set("X-Forwarded-For", "127.0.0.1")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden || queries != 2 {
+		t.Fatalf("cached snapshot crossed loopback boundary: status=%d queries=%d", w.Code, queries)
+	}
+}
+
+func TestGitHubActivityCachedIdentityFailureDoesNotLeakSnapshot(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	client := &githubactivity.Client{Cache: githubactivity.NewSnapshotCache(t.TempDir()), Run: func(context.Context, []byte) ([]byte, error) {
+		return []byte(`{"errors":[{"message":"private identity error"}]}`), nil
+	}}
+	h := &Handler{githubActivityClient: client}
+	router := gin.New()
+	router.GET("/github", h.GetGitHubActivity)
+	req := httptest.NewRequest(http.MethodGet, "/github?repository=owner/repo&since="+time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)+"&until="+time.Now().UTC().Format(time.RFC3339), nil)
+	req.RemoteAddr = "127.0.0.1:1234"
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusServiceUnavailable || strings.Contains(w.Body.String(), "private identity") || !strings.Contains(w.Body.String(), "github_unavailable") {
+		t.Fatalf("identity error leaked or succeeded: status=%d body=%s", w.Code, w.Body.String())
 	}
 }

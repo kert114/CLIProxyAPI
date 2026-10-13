@@ -34,15 +34,9 @@ func (h *Handler) GetGitHubActivity(c *gin.Context) {
 	if client == nil {
 		client = githubactivity.NewClient()
 	}
-	var snapshot githubactivity.Snapshot
-	var errFetch error
-	if organization != "" {
-		snapshot, errFetch = client.FetchOrganization(c.Request.Context(), account, organization, since, until)
-	} else if account != "" {
-		snapshot, errFetch = client.FetchAccount(c.Request.Context(), account, since, until)
-	} else {
-		snapshot, errFetch = client.Fetch(c.Request.Context(), repository, since, until)
-	}
+	snapshot, errFetch := client.FetchCached(c.Request.Context(), githubactivity.SnapshotScope{
+		Repository: repository, Account: account, Organization: organization, Since: since, Until: until,
+	}, c.Query("refresh") == "1")
 	if errFetch != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "GitHub activity could not be fetched. Check gh auth status and repository access, then refresh.", "code": "github_unavailable"})
 		return

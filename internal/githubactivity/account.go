@@ -40,7 +40,7 @@ type prSearch struct {
 }
 
 const accountPRFields = `fragment AccountPR on PullRequest {
- number title url state createdAt isDraft reviewDecision mergeable author {login}
+ number title url state createdAt updatedAt isDraft reviewDecision mergeable author {login}
  repository {nameWithOwner}
  commits(last:1) {nodes {commit {statusCheckRollup {state}}}}
 }`
