@@ -2,6 +2,10 @@
 
 Go 1.26+ proxy server providing OpenAI/Gemini/Claude/Codex compatible APIs with OAuth and round-robin load balancing.
 
+## Agent models
+- Use only Codex for work in this repository, including delegated tasks and reviews, unless the user started the conversation with Opus.
+- This repository rule overrides general model-routing guidance in personal instructions and skills.
+
 ## Repository
 - GitHub: https://github.com/router-for-me/CLIProxyAPI
 
