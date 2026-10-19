@@ -67,3 +67,6 @@ docker-compose.override.yml
 
 # Local LLM Wiki vault
 .llm-wiki
+
+# Local GitHub dashboard history and PR cache (private account metadata).
+.cliproxy-cache/

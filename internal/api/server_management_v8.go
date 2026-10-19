@@ -33,6 +33,7 @@ func (s *Server) registerManagementV8Routes() {
 	v8.GET("/routing/model-definitions/:channel", s.mgmt.GetStaticModelDefinitions)
 
 	v8.GET("/observability/github", s.mgmt.GetGitHubActivity)
+	v8.GET("/observability/github/dashboard", s.mgmt.GetGitHubDashboard)
 	v8.GET("/observability/logs", s.mgmt.GetLogs)
 	v8.DELETE("/observability/logs", s.mgmt.DeleteLogs)
 	v8.GET("/observability/logs/errors", s.mgmt.GetRequestErrorLogs)
