@@ -121,6 +121,7 @@ const query = `query($owner:String!, $name:String!, $since:GitTimestamp!, $until
 }`
 
 type githubPR struct {
+	ID                                                                 string
 	Repository                                                         struct{ NameWithOwner string }
 	Number                                                             int
 	Title, URL, ReviewDecision, Mergeable, State, CreatedAt, UpdatedAt string

@@ -228,3 +228,47 @@ or no usable snapshot exists, the response is a sanitized 503 with
 `code=github_unavailable`. The browser can retain its own prior snapshot during
 that error, but the server does not serve unverified cached data. Activity lists
 are samples; daily charts derived from those lists must indicate their coverage.
+
+### Incremental workspace dashboard
+
+`GET /observability/github/dashboard` separates contribution statistics from live
+pull request state. It requires the same management key and direct loopback
+connection as the activity endpoint. Supply `account`, optional `organization`,
+and `section=statistics` or `section=pulls`. `refresh=1` requests a manual
+refresh, subject to a 15-second minimum interval and outage backoff.
+
+- **Statistics:** supply `year` (1970 through the current UTC year). The response
+  contains `year`, `days` (`date` and `contributions`), `checked_at`, and `stale`.
+  Counts come from GitHub's contribution calendar, not sampled commit lists.
+  They include the contribution types GitHub counts; they are not commit-only
+  totals. Dates use UTC, and future dates are omitted. Daily totals cannot
+  establish an hourly or per-type breakdown. Private contributions require
+  GitHub CLI's `read:user` permission in addition to repository access.
+- **Pull requests:** the response contains `pull_requests`, `checked_at`,
+  `stale`, and `truncated`. PRs include their repository, GitHub URL, lifecycle,
+  review decision, check rollup, mergeability, and creation/update timestamps.
+  Unknown mergeability does not mean there are no conflicts. A cold load finds
+  open PRs and up to 25 recently updated closed PRs from the last 30 days.
+  `truncated=true` identifies incomplete coverage. Later loads search changes
+  since the last successful refresh with a 15-minute overlap and also refresh
+  currently open PR nodes, because checks may change without a new PR update
+  timestamp. Open-PR inventory is reconciled every six hours. Each search page
+  contains at most 25 PRs, and results are bounded at 1,000 PRs.
+
+The backend stores these results in an owner-only JSON cache at
+`.cliproxy-cache/github-dashboard.json` beside the configuration file. No new
+service or database is required. Cache files contain account activity metadata,
+not authentication tokens. Entries are isolated by the verified GitHub viewer,
+account, organization and year/section; the current CLI identity is checked
+before returning cached data. The cache is bounded to 32 entries and 8 MiB.
+
+Current-year statistics refresh no faster than every five minutes, replacing
+the latest 35 days while preserving older daily totals. The whole year is
+reconciled every 30 days to catch backfills, deletions and other corrections.
+Past years are revalidated after 30 days. PR state has a one-minute TTL and its
+refresh never fetches contribution history. Concurrent identical requests are
+coalesced. Failures keep a successfully saved result marked stale and back off
+for 30 seconds, but identity failures do not expose cached results. Manual
+refresh does not bypass these identity checks or the minimum request interval.
+There is no background server polling: queries run only when clients request
+these sections. The dashboard pauses its own polling while the tab is hidden.

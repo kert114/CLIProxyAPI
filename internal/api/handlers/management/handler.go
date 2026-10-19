@@ -65,6 +65,7 @@ type Handler struct {
 	pluginReleases          pluginReleaseCache
 	cursorUsageClient       *cursorusage.Client
 	githubActivityClient    *githubactivity.Client
+	githubDashboard         *githubactivity.Dashboard
 }
 
 type configReloadSnapshot struct {
@@ -88,6 +89,11 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		cursorUsageClient:    cursorusage.NewClient(),
 		githubActivityClient: githubactivity.NewClient(),
 	}
+	cachePath := ""
+	if configFilePath != "" {
+		cachePath = filepath.Join(filepath.Dir(configFilePath), ".cliproxy-cache", "github-dashboard.json")
+	}
+	h.githubDashboard = githubactivity.NewDashboard(h.githubActivityClient, cachePath)
 	h.startAttemptCleanup()
 	return h
 }
