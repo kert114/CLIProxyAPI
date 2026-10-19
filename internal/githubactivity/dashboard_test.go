@@ -3,6 +3,7 @@ package githubactivity
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -295,5 +296,87 @@ func TestDashboardRecentCalendarReplacementRemovesOldCounts(t *testing.T) {
 	}
 	if latest.Days[0].Contributions != 3 {
 		t.Fatal("refresh modified stable history")
+	}
+}
+
+func TestDashboardOAuthScopeChangeReloadsFullHistory(t *testing.T) {
+	calls := 0
+	intervals := [][2]string{}
+	scopes := "repo, read:org"
+	base := calendarRunner(t, &calls, &intervals)
+	client := &Client{Run: func(ctx context.Context, input []byte) ([]byte, error) {
+		if strings.Contains(string(input), "DashboardViewer") {
+			return []byte("HTTP/2.0 200 OK\r\nX-Oauth-Scopes: " + scopes + "\r\nContent-Type: application/json\r\n\r\n" + `{"data":{"viewer":{"id":"viewer-1","login":"tester"}}}`), nil
+		}
+		return base(ctx, input)
+	}}
+	d := NewDashboard(client, "")
+	d.now = func() time.Time { return time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC) }
+	_, err := d.Statistics(context.Background(), "tester", "example", 2026, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := calls
+	scopes = "repo, read:org, read:user"
+	_, err = d.Statistics(context.Background(), "tester", "example", 2026, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls == before || intervals[len(intervals)-1][0] != "2026-01-01" {
+		t.Fatal("new private-contribution permission reused incomplete public history")
+	}
+}
+
+func TestDashboardCacheEvictsByBytes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cache.json")
+	d := NewDashboard(&Client{}, path)
+	for i := 0; i < 32; i++ {
+		rows := make([]DashboardPullRequest, 1000)
+		for j := range rows {
+			rows[j].Title = strings.Repeat("ordinary title ", 40)
+		}
+		d.save(fmt.Sprint(i), dashboardEntry{Pulls: &PullRequests{CheckedAt: time.Unix(int64(i), 0), PullRequests: rows}})
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, _ := json.Marshal(d.entries)
+	if len(encoded) > 8<<20 {
+		t.Fatalf("memory cache exceeds byte limit: %d", len(encoded))
+	}
+	restarted := NewDashboard(&Client{}, path)
+	if len(restarted.entries) != len(d.entries) || restarted.entries["31"].Pulls == nil {
+		t.Fatalf("disk cache stopped persisting: disk %d memory %d bytes %d", len(restarted.entries), len(d.entries), len(data))
+	}
+}
+func TestDashboardFailedManualRefreshRemainsStaleUntilRecovery(t *testing.T) {
+	for _, section := range []string{"statistics", "pulls"} {
+		t.Run(section, func(t *testing.T) {
+			now := time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC)
+			d := NewDashboard(&Client{Run: func(context.Context, []byte) ([]byte, error) { return nil, ErrUnavailable }}, "")
+			d.now = func() time.Time { return now }
+			key := "scope"
+			d.save(key, dashboardEntry{Statistics: &Statistics{CheckedAt: now}, Pulls: &PullRequests{CheckedAt: now}, FullCheckedAt: now})
+			fetch := func(force bool) (bool, string) {
+				if section == "statistics" {
+					s, _ := d.statistics(context.Background(), key, "tester", "example", 2026, force)
+					return s.Stale, s.Warning
+				}
+				s, _ := d.pulls(context.Background(), key, "tester", "example", force)
+				return s.Stale, s.Warning
+			}
+			now = now.Add(16 * time.Second)
+			if stale, _ := fetch(true); !stale {
+				t.Fatal("failed manual refresh must be stale")
+			}
+			if stale, warning := fetch(false); !stale || warning == "" {
+				t.Fatal("poll concealed failed refresh")
+			}
+			now = now.Add(31 * time.Second)
+			if stale, _ := fetch(false); !stale {
+				t.Fatal("expired backoff concealed failure without recovery")
+			}
+		})
 	}
 }

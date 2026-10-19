@@ -71,7 +71,11 @@ func NewClient() *Client {
 		cacheDirectory = filepath.Join(directory, "CLIProxyAPI", "github-activity")
 	}
 	return &Client{Cache: NewSnapshotCache(cacheDirectory), Run: func(ctx context.Context, input []byte) ([]byte, error) {
-		cmd := exec.CommandContext(ctx, "gh", "api", "graphql", "--hostname", "github.com", "--input", "-")
+		args := []string{"api", "graphql", "--hostname", "github.com", "--input", "-"}
+		if bytes.Contains(input, []byte("query DashboardViewer ")) {
+			args = append(args, "--include")
+		}
+		cmd := exec.CommandContext(ctx, "gh", args...)
 		cmd.Stdin = bytes.NewReader(input)
 		return cmd.Output()
 	}}

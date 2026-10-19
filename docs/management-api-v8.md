@@ -244,6 +244,8 @@ refresh, subject to a 15-second minimum interval and outage backoff.
   totals. Dates use UTC, and future dates are omitted. Daily totals cannot
   establish an hourly or per-type breakdown. Private contributions require
   GitHub CLI's `read:user` permission in addition to repository access.
+  `limited=true` warns when the CLI reports OAuth scopes without `read:user`.
+  Run `gh auth refresh --hostname github.com --scopes read:user` to grant it.
 - **Pull requests:** the response contains `pull_requests`, `checked_at`,
   `stale`, and `truncated`. PRs include their repository, GitHub URL, lifecycle,
   review decision, check rollup, mergeability, and creation/update timestamps.
@@ -259,7 +261,8 @@ The backend stores these results in an owner-only JSON cache at
 `.cliproxy-cache/github-dashboard.json` beside the configuration file. No new
 service or database is required. Cache files contain account activity metadata,
 not authentication tokens. Entries are isolated by the verified GitHub viewer,
-account, organization and year/section; the current CLI identity is checked
+account, organization, OAuth scope fingerprint and year/section. A permission
+change invalidates old coverage. The current CLI identity is checked
 before returning cached data. The cache is bounded to 32 entries and 8 MiB.
 
 Current-year statistics refresh no faster than every five minutes, replacing

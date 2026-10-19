@@ -1,10 +1,15 @@
 package githubactivity
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -28,6 +33,7 @@ type Statistics struct {
 	CheckedAt    time.Time         `json:"checked_at"`
 	Stale        bool              `json:"stale"`
 	Warning      string            `json:"warning,omitempty"`
+	Limited      bool              `json:"limited"`
 }
 type DashboardPullRequest struct {
 	PullRequest
@@ -108,14 +114,23 @@ func (d *Dashboard) save(key string, entry dashboardEntry) {
 	defer d.mu.Unlock()
 	d.entries[key] = entry
 	delete(d.retryAfter, key)
-	if len(d.entries) > maxDashboardEntries {
+	for {
+		data, err := json.Marshal(d.entries)
+		if err == nil && len(d.entries) <= maxDashboardEntries && len(data) <= (8<<20)-128 {
+			break
+		}
 		oldest := ""
 		for k, e := range d.entries {
 			if k != key && (oldest == "" || entryTime(e).Before(entryTime(d.entries[oldest]))) {
 				oldest = k
 			}
 		}
+		if oldest == "" {
+			delete(d.entries, key)
+			break
+		}
 		delete(d.entries, oldest)
+		delete(d.retryAfter, oldest)
 	}
 	if d.path == "" {
 		return
@@ -183,7 +198,7 @@ func (d *Dashboard) Statistics(ctx context.Context, account, organization string
 	if errViewer != nil {
 		return Statistics{}, errViewer
 	}
-	key := dashboardKey("statistics", account, organization, year) + "|" + viewer
+	key := dashboardKey("statistics", account, organization, year) + "|" + viewer.key
 	result := d.flights.DoChan(key, func() (any, error) {
 		return d.statistics(context.WithoutCancel(ctx), key, account, organization, year, force)
 	})
@@ -194,7 +209,9 @@ func (d *Dashboard) Statistics(ctx context.Context, account, organization string
 		if answer.Err != nil {
 			return Statistics{}, answer.Err
 		}
-		return cloneStatistics(answer.Val.(Statistics)), nil
+		result := cloneStatistics(answer.Val.(Statistics))
+		result.Limited = viewer.limited
+		return result, nil
 	}
 }
 func (d *Dashboard) statistics(ctx context.Context, key, account, organization string, year int, force bool) (Statistics, error) {
@@ -204,7 +221,7 @@ func (d *Dashboard) statistics(ctx context.Context, key, account, organization s
 	if year < now.Year() {
 		ttl = 30 * 24 * time.Hour
 	}
-	if old.Statistics != nil && fresh(old.Statistics.CheckedAt, now, ttl, force) {
+	if retry.IsZero() && old.Statistics != nil && fresh(old.Statistics.CheckedAt, now, ttl, force) {
 		return *old.Statistics, nil
 	}
 	if now.Before(retry) {
@@ -330,19 +347,57 @@ func (d *Dashboard) fetchCalendar(ctx context.Context, account, organization str
 	return days, nil
 }
 
-func (d *Dashboard) viewer(ctx context.Context, account string) (string, error) {
+type dashboardViewer struct {
+	key     string
+	limited bool
+}
+
+func (d *Dashboard) viewer(ctx context.Context, account string) (dashboardViewer, error) {
 	if errContext := ctx.Err(); errContext != nil {
-		return "", errContext
+		return dashboardViewer{}, errContext
 	}
-	var identity struct{ Viewer *struct{ ID, Login string } }
-	if err := d.client.request(ctx, `query DashboardViewer {viewer{id login}}`, nil, &identity); err != nil {
-		return "", err
+	input, _ := json.Marshal(map[string]any{"query": "query DashboardViewer {viewer{id login}}"})
+	raw, errRun := d.client.Run(ctx, input)
+	if errRun != nil {
+		return dashboardViewer{}, ErrUnavailable
 	}
-	if identity.Viewer == nil || identity.Viewer.ID == "" {
-		return "", ErrUnavailable
+	fingerprint := "unknown"
+	limited := false
+	if bytes.HasPrefix(raw, []byte("HTTP/")) {
+		response, errResponse := http.ReadResponse(bufio.NewReader(bytes.NewReader(raw)), nil)
+		if errResponse != nil {
+			return dashboardViewer{}, ErrUnavailable
+		}
+		body, errRead := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+		if errClose := response.Body.Close(); errClose != nil {
+			log.Warn("Could not close GitHub identity metadata")
+		}
+		if errRead != nil || response.StatusCode != http.StatusOK {
+			return dashboardViewer{}, ErrUnavailable
+		}
+		if _, known := response.Header["X-Oauth-Scopes"]; known {
+			scopes := strings.Split(response.Header.Get("X-Oauth-Scopes"), ",")
+			private := false
+			for i := range scopes {
+				scopes[i] = strings.TrimSpace(scopes[i])
+				private = private || scopes[i] == "read:user" || scopes[i] == "user"
+			}
+			sort.Strings(scopes)
+			digest := sha256.Sum256([]byte(strings.Join(scopes, ",")))
+			fingerprint = hex.EncodeToString(digest[:])
+			limited = !private
+		}
+		raw = body
 	}
-	if !strings.EqualFold(identity.Viewer.Login, account) {
-		return "", ErrAccountMismatch
+	var identity struct {
+		Errors []json.RawMessage
+		Data   struct{ Viewer *struct{ ID, Login string } }
 	}
-	return identity.Viewer.ID, nil
+	if json.Unmarshal(raw, &identity) != nil || len(identity.Errors) > 0 || identity.Data.Viewer == nil || identity.Data.Viewer.ID == "" {
+		return dashboardViewer{}, ErrUnavailable
+	}
+	if !strings.EqualFold(identity.Data.Viewer.Login, account) {
+		return dashboardViewer{}, ErrAccountMismatch
+	}
+	return dashboardViewer{key: identity.Data.Viewer.ID + "|" + fingerprint, limited: limited}, nil
 }

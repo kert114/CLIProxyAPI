@@ -25,7 +25,7 @@ func (d *Dashboard) PullRequests(ctx context.Context, account, organization stri
 	if errViewer != nil {
 		return PullRequests{}, errViewer
 	}
-	key := dashboardKey("pulls", account, organization, 0) + "|" + viewer
+	key := dashboardKey("pulls", account, organization, 0) + "|" + viewer.key
 	result := d.flights.DoChan(key, func() (any, error) { return d.pulls(context.WithoutCancel(ctx), key, account, organization, force) })
 	select {
 	case <-ctx.Done():
@@ -42,7 +42,7 @@ func (d *Dashboard) PullRequests(ctx context.Context, account, organization stri
 func (d *Dashboard) pulls(ctx context.Context, key, account, organization string, force bool) (PullRequests, error) {
 	now := d.now().UTC()
 	old, retry := d.entry(key)
-	if old.Pulls != nil && fresh(old.Pulls.CheckedAt, now, time.Minute, force) {
+	if retry.IsZero() && old.Pulls != nil && fresh(old.Pulls.CheckedAt, now, time.Minute, force) {
 		return *old.Pulls, nil
 	}
 	if now.Before(retry) {
