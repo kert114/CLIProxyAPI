@@ -28,6 +28,19 @@ When a task changes files in this repository, land them on `main` before you sto
 
 The task is done when those commits are on `main`.
 
+This personal repository has standing authorization to merge verified changes into
+`main` and update the corresponding local CLIProxyAPI service without a separate
+approval request. Create a PR for history, run the relevant checks, then merge it
+yourself and apply the completed change locally. Do not wait for another approval
+or a human review solely because a PR exists. Preserve rollback copies when
+replacing local artifacts, and avoid a service restart when an HTML update is
+sufficient. Keep secrets, local configuration and unrelated work intact.
+
+This exception applies only to this personal CLIProxyAPI project. It does not
+authorize changes to other projects, hosted environments, destructive data
+operations or unrelated services. Repository protections and failing checks must
+still be respected; never bypass them.
+
 ## Config
 - Default config: `config.yaml` (template: `config.example.yaml`)
 - `.env` is auto-loaded from the working directory
