@@ -126,7 +126,11 @@ access:
 
 # Routing strategy for selecting credentials when multiple match.
 routing:
-  strategy: "round-robin" # round-robin (default), weighted-round-robin, fill-first
+  strategy: "round-robin" # round-robin (default), weighted-round-robin, fill-first, reset-first
+  # reset-first consumes Claude accounts by earliest weekly reset, then earliest 5h reset.
+  # Uses passive response headers; missing or expired weekly resets fall back to round-robin
+  # until normal requests supply current observations. Other providers use round-robin.
+  # Enable session-affinity below to keep existing chats on their assigned account.
   # weighted-round-robin uses each credential's integer weight (default 1, maximum 1,000,000).
   # Non-positive weights exclude the credential while this strategy is active.
   # For OAuth/file credentials, add a top-level numeric "weight" field to the auth JSON.

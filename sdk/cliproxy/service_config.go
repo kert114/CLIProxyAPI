@@ -44,6 +44,8 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 	switch strings.ToLower(strings.TrimSpace(cfg.Routing.Strategy)) {
 	case "weighted-round-robin", "weightedroundrobin", "wrr":
 		state.strategy = "weighted-round-robin"
+	case "reset-first":
+		state.strategy = "reset-first"
 	case "fill-first", "fillfirst", "ff":
 		state.strategy = "fill-first"
 	}
@@ -67,6 +69,8 @@ func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
 	switch state.strategy {
 	case "weighted-round-robin":
 		selector = &coreauth.WeightedRoundRobinSelector{}
+	case "reset-first":
+		selector = &coreauth.ResetFirstSelector{}
 	case "fill-first":
 		selector = &coreauth.FillFirstSelector{}
 	default:
