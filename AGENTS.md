@@ -42,6 +42,8 @@ operations or unrelated services. Repository protections and failing checks must
 still be respected; never bypass them.
 
 ## Config
+- Never read or retrieve the local proxy access key from `access.api-keys`, legacy `api-keys`, `ANTHROPIC_AUTH_TOKEN`, or stored copies unless the user explicitly authorizes access to that key for the current task.
+- Inspect only selected non-secret configuration fields. Do not dump credential-bearing config files, process environments, or secret stores. Diagnose authentication using redacted status and metadata.
 - Default config: `config.yaml` (template: `config.example.yaml`)
 - `.env` is auto-loaded from the working directory
 - Auth material defaults under `auths/`
