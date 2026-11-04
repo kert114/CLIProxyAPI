@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -10,9 +11,23 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
+const (
+	// resetFirstFiveHourLimit is the observed five-hour utilization at which an account
+	// stops receiving new work while another account in the same group has headroom.
+	resetFirstFiveHourLimit = 0.8
+	// subagentRequestMetadataKey marks requests that SessionAffinitySelector identified as subagents.
+	subagentRequestMetadataKey = "cliproxy_routing_subagent"
+	// SessionRoleHeader lets a client declare a delegated session as a subagent.
+	SessionRoleHeader = "X-CLIProxy-Session-Role"
+	// AttributeSubagentOnly marks a credential reserved for subagent traffic.
+	AttributeSubagentOnly = "subagent_only"
+)
+
 // ResetFirstSelector consumes Claude accounts in weekly-reset order, then five-hour
 // reset order. Missing weekly observations use round-robin so every account can
 // acquire a snapshot through normal requests. Other providers retain round-robin.
+// Before ordering, subagent_only accounts are reserved for subagent requests and
+// accounts near their five-hour limit are skipped while a peer has headroom.
 // Wrap it in SessionAffinitySelector to keep existing conversations on their account.
 type ResetFirstSelector struct {
 	fallback RoundRobinSelector
@@ -35,6 +50,7 @@ func (s *ResetFirstSelector) Pick(ctx context.Context, provider, model string, o
 			}
 		}
 	}
+	available = resetFirstCandidates(available, isSubagentRequest(opts), now)
 	var selected *Auth
 	var selectedWeekly, selectedFiveHour time.Time
 	for _, candidate := range available {
@@ -49,6 +65,81 @@ func (s *ResetFirstSelector) Pick(ctx context.Context, provider, model string, o
 		}
 	}
 	return selected, nil
+}
+
+// resetFirstCandidates narrows available accounts to the first non-empty tier.
+// Subagents try subagent_only accounts, then the rest; top-level requests try the
+// rest, then subagent_only accounts. Within each group, accounts with five-hour
+// headroom come first. Subagents move to any account with headroom before
+// pushing a busy subagent_only account into its five-hour limit.
+func resetFirstCandidates(auths []*Auth, subagent bool, now time.Time) []*Auth {
+	var preferred, other []*Auth
+	for _, candidate := range auths {
+		if authSubagentOnly(candidate) == subagent {
+			preferred = append(preferred, candidate)
+		} else {
+			other = append(other, candidate)
+		}
+	}
+	tiers := [][]*Auth{withFiveHourHeadroom(preferred, now), preferred, withFiveHourHeadroom(other, now), other}
+	if subagent {
+		tiers = [][]*Auth{withFiveHourHeadroom(preferred, now), withFiveHourHeadroom(other, now), preferred, other}
+	}
+	for _, tier := range tiers {
+		if len(tier) > 0 {
+			return tier
+		}
+	}
+	return auths
+}
+
+func withFiveHourHeadroom(auths []*Auth, now time.Time) []*Auth {
+	var out []*Auth
+	for _, candidate := range auths {
+		if claudeFiveHourUtilization(candidate.Quota.Signals, now) < resetFirstFiveHourLimit {
+			out = append(out, candidate)
+		}
+	}
+	return out
+}
+
+// claudeFiveHourUtilization returns the last observed five-hour utilization (0-1),
+// or 0 when the observation is missing or its window has already reset.
+func claudeFiveHourUtilization(signals map[string]string, now time.Time) float64 {
+	if claudeResetTime(signals, "5h", now).IsZero() {
+		return 0
+	}
+	raw := strings.TrimSpace(signals[http.CanonicalHeaderKey("Anthropic-Ratelimit-Unified-5h-Utilization")])
+	utilization, errParse := strconv.ParseFloat(raw, 64)
+	if errParse != nil || math.IsNaN(utilization) || math.IsInf(utilization, 0) {
+		return 0
+	}
+	return utilization
+}
+
+func authSubagentOnly(auth *Auth) bool {
+	if auth == nil {
+		return false
+	}
+	if raw, ok := auth.Attributes[AttributeSubagentOnly]; ok {
+		enabled, _ := strconv.ParseBool(strings.TrimSpace(raw))
+		return enabled
+	}
+	switch value := auth.Metadata[AttributeSubagentOnly].(type) {
+	case bool:
+		return value
+	case string:
+		enabled, _ := strconv.ParseBool(strings.TrimSpace(value))
+		return enabled
+	}
+	return false
+}
+
+func isSubagentRequest(opts cliproxyexecutor.Options) bool {
+	if flagged, ok := opts.Metadata[subagentRequestMetadataKey].(bool); ok && flagged {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(opts.Headers.Get(SessionRoleHeader)), "subagent")
 }
 
 func claudeResetTime(signals map[string]string, window string, now time.Time) time.Time {

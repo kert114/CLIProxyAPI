@@ -1044,6 +1044,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		}
 	}
 	isSubagent := !isFork && isSubagentSession(primaryID, fallbackID)
+	opts.Metadata[subagentRequestMetadataKey] = isSubagent
 	fallbackKey := ""
 	if fallbackID != "" && fallbackID != primaryID {
 		fallbackKey = provider + "::" + fallbackID + "::" + modelKey
