@@ -70,7 +70,8 @@ func (s *ResetFirstSelector) Pick(ctx context.Context, provider, model string, o
 // resetFirstCandidates narrows available accounts to the first non-empty tier.
 // Subagents try subagent_only accounts, then the rest; top-level requests try the
 // rest, then subagent_only accounts. Within each group, accounts with five-hour
-// headroom come first.
+// headroom come first. Subagents move to any account with headroom before
+// pushing a busy subagent_only account into its five-hour limit.
 func resetFirstCandidates(auths []*Auth, subagent bool, now time.Time) []*Auth {
 	var preferred, other []*Auth
 	for _, candidate := range auths {
