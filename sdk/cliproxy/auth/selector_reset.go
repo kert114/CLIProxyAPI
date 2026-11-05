@@ -50,7 +50,8 @@ func (s *ResetFirstSelector) Pick(ctx context.Context, provider, model string, o
 			}
 		}
 	}
-	available = resetFirstCandidates(available, isSubagentRequest(opts), now)
+	full, _ := opts.Metadata[subagentFullAuthsMetadataKey].(map[string]bool)
+	available = resetFirstCandidates(available, isSubagentRequest(opts), full, now)
 	var selected *Auth
 	var selectedWeekly, selectedFiveHour time.Time
 	for _, candidate := range available {
@@ -71,11 +72,14 @@ func (s *ResetFirstSelector) Pick(ctx context.Context, provider, model string, o
 // Subagents try subagent_only accounts, then the rest; top-level requests try the
 // rest, then subagent_only accounts. Within each group, accounts with five-hour
 // headroom come first. Subagents move to any account with headroom before
-// pushing a busy subagent_only account into its five-hour limit.
-func resetFirstCandidates(auths []*Auth, subagent bool, now time.Time) []*Auth {
-	var preferred, other []*Auth
+// pushing a busy subagent_only account into its five-hour limit, and use a
+// subagent_only account that reached its session cap only as a last resort.
+func resetFirstCandidates(auths []*Auth, subagent bool, full map[string]bool, now time.Time) []*Auth {
+	var preferred, other, capped []*Auth
 	for _, candidate := range auths {
-		if authSubagentOnly(candidate) == subagent {
+		if subagent && full[candidate.ID] {
+			capped = append(capped, candidate)
+		} else if authSubagentOnly(candidate) == subagent {
 			preferred = append(preferred, candidate)
 		} else {
 			other = append(other, candidate)
@@ -83,7 +87,7 @@ func resetFirstCandidates(auths []*Auth, subagent bool, now time.Time) []*Auth {
 	}
 	tiers := [][]*Auth{withFiveHourHeadroom(preferred, now), preferred, withFiveHourHeadroom(other, now), other}
 	if subagent {
-		tiers = [][]*Auth{withFiveHourHeadroom(preferred, now), withFiveHourHeadroom(other, now), preferred, other}
+		tiers = [][]*Auth{withFiveHourHeadroom(preferred, now), withFiveHourHeadroom(other, now), preferred, other, capped}
 	}
 	for _, tier := range tiers {
 		if len(tier) > 0 {
@@ -139,7 +143,11 @@ func isSubagentRequest(opts cliproxyexecutor.Options) bool {
 	if flagged, ok := opts.Metadata[subagentRequestMetadataKey].(bool); ok && flagged {
 		return true
 	}
-	return strings.EqualFold(strings.TrimSpace(opts.Headers.Get(SessionRoleHeader)), "subagent")
+	return hasSubagentRoleHeader(opts.Headers)
+}
+
+func hasSubagentRoleHeader(headers http.Header) bool {
+	return strings.EqualFold(strings.TrimSpace(headers.Get(SessionRoleHeader)), "subagent")
 }
 
 func claudeResetTime(signals map[string]string, window string, now time.Time) time.Time {

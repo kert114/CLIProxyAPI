@@ -136,7 +136,9 @@ routing:
   # Add a top-level "subagent_only": true to a Claude auth JSON to reserve it for subagents:
   # requests detected as subagents (Claude Code agent IDs, parent session IDs, or the
   # X-CLIProxy-Session-Role: subagent header) prefer it, and top-level chats use it only when
-  # no other account is available. Set session-affinity-subagents: false so subagents are
+  # no other account is available. At most 3 subagent sessions active in the last 5 minutes
+  # use one subagent_only account (override with "max_subagent_sessions": N); further subagents
+  # go to other accounts. Set session-affinity-subagents: false so subagents are
   # routed independently instead of inheriting the parent's account.
   # weighted-round-robin uses each credential's integer weight (default 1, maximum 1,000,000).
   # Non-positive weights exclude the credential while this strategy is active.
