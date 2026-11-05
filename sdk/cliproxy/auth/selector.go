@@ -914,6 +914,7 @@ type SessionAffinitySelector struct {
 	cache            *SessionCache
 	matcher          *cliproxysession.MerklePrefixMatcher
 	subagentAffinity bool
+	subagents        subagentLoad
 }
 
 // SessionAffinityConfig configures the session affinity selector.
@@ -971,10 +972,22 @@ func (s *SessionAffinitySelector) Trees() *cliproxysession.InMemorySessionTreeSt
 // a session uses multiple models (e.g., gemini-2.5-pro and gemini-3-flash-preview)
 // that may be supported by different auth credentials, and to avoid cross-provider conflicts.
 func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
-	entry := selectorLogEntry(ctx)
 	if opts.Metadata == nil {
 		opts.Metadata = make(map[string]any)
 	}
+	delete(opts.Metadata, subagentSessionMetadataKey)
+	delete(opts.Metadata, subagentFullAuthsMetadataKey)
+	auth, err := s.pick(ctx, provider, model, opts, auths)
+	if err == nil && auth != nil {
+		if session, ok := opts.Metadata[subagentSessionMetadataKey].(string); ok && session != "" {
+			s.subagents.record(session, auth.ID, time.Now())
+		}
+	}
+	return auth, err
+}
+
+func (s *SessionAffinitySelector) pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+	entry := selectorLogEntry(ctx)
 	opts.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey] = provider
 	opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = model
 
@@ -1044,7 +1057,14 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		}
 	}
 	isSubagent := !isFork && isSubagentSession(primaryID, fallbackID)
-	opts.Metadata[subagentRequestMetadataKey] = isSubagent
+	subagentRequest := isSubagent || hasSubagentRoleHeader(opts.Headers)
+	opts.Metadata[subagentRequestMetadataKey] = subagentRequest
+	if subagentRequest {
+		// Count each subagent once per session, whatever models it uses.
+		loadKey := provider + "::" + primaryID
+		opts.Metadata[subagentSessionMetadataKey] = loadKey
+		opts.Metadata[subagentFullAuthsMetadataKey] = s.subagents.fullAuths(available, loadKey, now)
+	}
 	fallbackKey := ""
 	if fallbackID != "" && fallbackID != primaryID {
 		fallbackKey = provider + "::" + fallbackID + "::" + modelKey
