@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"net/http"
 	"strconv"
 	"testing"
@@ -108,5 +109,22 @@ func TestSessionRoleHeaderCountsAsSubagent(t *testing.T) {
 	top := cliproxyexecutor.Options{Headers: http.Header{"X-Claude-Code-Session-Id": {"top-level"}}}
 	if got := pickReset(t, selector, top, auths); got != "max" {
 		t.Fatalf("top-level chat picked %q, want max", got)
+	}
+}
+
+func TestSubagentCapCountsSessionOnceAcrossModels(t *testing.T) {
+	selector := newCapSelector(t)
+	team, max := capTestAuths()
+	auths := []*Auth{team, max}
+	for _, model := range []string{"opus", "haiku"} {
+		for i := 1; i <= 2; i++ {
+			got, err := selector.Pick(context.Background(), "claude", model, subagentOpts("agent-"+strconv.Itoa(i)), auths)
+			if err != nil || got.ID != "team" {
+				t.Fatalf("agent-%d on %s picked %v (%v), want team", i, model, got, err)
+			}
+		}
+	}
+	if got := pickReset(t, selector, subagentOpts("agent-3"), auths); got != "team" {
+		t.Fatalf("third subagent picked %q, want team", got)
 	}
 }

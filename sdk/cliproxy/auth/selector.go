@@ -976,6 +976,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		opts.Metadata = make(map[string]any)
 	}
 	delete(opts.Metadata, subagentSessionMetadataKey)
+	delete(opts.Metadata, subagentFullAuthsMetadataKey)
 	auth, err := s.pick(ctx, provider, model, opts, auths)
 	if err == nil && auth != nil {
 		if session, ok := opts.Metadata[subagentSessionMetadataKey].(string); ok && session != "" {
@@ -1059,10 +1060,10 @@ func (s *SessionAffinitySelector) pick(ctx context.Context, provider, model stri
 	subagentRequest := isSubagent || hasSubagentRoleHeader(opts.Headers)
 	opts.Metadata[subagentRequestMetadataKey] = subagentRequest
 	if subagentRequest {
-		opts.Metadata[subagentSessionMetadataKey] = cacheKey
-		opts.Metadata[subagentFullAuthsMetadataKey] = s.subagents.fullAuths(available, cacheKey, now)
-	} else {
-		delete(opts.Metadata, subagentFullAuthsMetadataKey)
+		// Count each subagent once per session, whatever models it uses.
+		loadKey := provider + "::" + primaryID
+		opts.Metadata[subagentSessionMetadataKey] = loadKey
+		opts.Metadata[subagentFullAuthsMetadataKey] = s.subagents.fullAuths(available, loadKey, now)
 	}
 	fallbackKey := ""
 	if fallbackID != "" && fallbackID != primaryID {
