@@ -380,3 +380,26 @@ for 30 seconds, but identity failures do not expose cached results. Manual
 refresh does not bypass these identity checks or the minimum request interval.
 There is no background server polling: queries run only when clients request
 these sections. The dashboard pauses its own polling while the tab is hidden.
+
+## Local agent activity
+
+`GET /observability/agent-activity` requires a management key and a direct
+loopback connection to CLIProxyAPI. It reads `GET /api/snapshot` from
+`agent-activity serve --port 8765` on the same machine as the proxy.
+
+Set `AGENT_ACTIVITY_URL` in the CLIProxyAPI process environment to change the
+dashboard origin. It defaults to `http://127.0.0.1:8765` and accepts only HTTP
+origins on a loopback IP or `localhost` (mapped to `127.0.0.1`). The proxy uses a
+fixed snapshot path and connects directly without following redirects or
+forwarding management credentials. The request has a ten-second deadline and
+the response is limited to 1 MiB.
+
+On success the endpoint returns the dashboard JSON with `Cache-Control: no-store`.
+Each item in `hosts` has an `alias`, `status`, `stale`, `reason` and a `snapshot`
+object or `null`. A snapshot contains the hostname, resource usage, pressure,
+agent counts and jobs. Unreachable enrolled hosts may include a last successful
+snapshot with their current status and reason.
+
+If the dashboard is unreachable or cannot return a valid snapshot, the endpoint
+returns HTTP 503 with `code=agent_activity_unavailable`. A non-loopback
+management request returns HTTP 403 with `code=agent_activity_local_only`.

@@ -1,0 +1,66 @@
+{
+  "ts": 1795615203.5,
+  "code_version": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "config": { "status": "ok", "hosts": ["build-vm", "spare-vm"] },
+  "hosts": [
+    {
+      "alias": "workstation",
+      "status": "ok",
+      "stale": false,
+      "reason": null,
+      "snapshot": {
+        "version": 1,
+        "host": "workstation",
+        "os": "Darwin",
+        "ts": 1795615203.0,
+        "cpu": { "status": "ok", "busy_percent": 42.5, "cores": 12 },
+        "memory": { "status": "ok", "used_bytes": 19327352832, "total_bytes": 25769803776 },
+        "swap": { "status": "ok", "used_bytes": 0, "total_bytes": 0 },
+        "disk": { "status": "ok", "used_bytes": 311385128960, "total_bytes": 536870912000 },
+        "pressure": { "status": "ok", "load_average": [3.4, 2.7, 2.1], "memory": { "level": 4, "compressor_bytes": 1073741824 } },
+        "heavy_slots": { "status": "ok", "used": 1, "queued": 1 },
+        "agents": { "status": "ok", "counts": { "queued": 1, "preparing": 0, "starting": 1, "running": 3, "waiting": 2, "waiting_for_children": 1 } },
+        "jobs": {
+          "status": "ok",
+          "running": [
+            { "event": "started", "job_id": "4bb061374f0d42ca9c4f02c920410001", "host": "workstation", "pid": 301, "created_at": 1795615157.0, "ts": 1795615158.0, "label": "go test ./...", "repo": "sample-api", "kind": "heavy", "t3_thread_id": null, "age_seconds": 45.0 }
+          ],
+          "queued": [
+            { "event": "queued", "job_id": "4bb061374f0d42ca9c4f02c920410002", "host": "workstation", "pid": 302, "created_at": 1795615187.0, "ts": 1795615188.0, "label": "bun run verify", "repo": "sample-panel", "kind": "heavy", "t3_thread_id": null, "wait_reason": "memory pressure", "age_seconds": 15.0 }
+          ],
+          "recent": [],
+          "wait_reasons": { "memory pressure": 1 }
+        },
+        "stacks": { "status": "ok", "items": [] }
+      }
+    },
+    {
+      "alias": "build-vm",
+      "status": "ok",
+      "stale": false,
+      "reason": null,
+      "snapshot": {
+        "version": 1,
+        "host": "build-vm.local",
+        "os": "Linux",
+        "ts": 1795615202.0,
+        "cpu": { "status": "ok", "busy_percent": 76.4, "cores": 8 },
+        "memory": { "status": "ok", "used_bytes": 10737418240, "total_bytes": 17179869184 },
+        "swap": { "status": "ok", "used_bytes": 268435456, "total_bytes": 2147483648 },
+        "disk": { "status": "ok", "used_bytes": 98784247808, "total_bytes": 107374182400 },
+        "pressure": { "status": "ok", "load_average": [10.3, 7.4, 6.0], "memory": { "some_avg10": 2.47, "full_avg10": 0.38 } },
+        "heavy_slots": { "status": "ok", "used": 0, "queued": 0 },
+        "agents": { "status": "ok", "counts": { "queued": 0, "preparing": 1, "starting": 0, "running": 2, "waiting": 0, "waiting_for_children": 0 } },
+        "jobs": { "status": "ok", "running": [], "queued": [], "recent": [], "wait_reasons": {} },
+        "stacks": { "status": "ok", "items": [] }
+      }
+    },
+    {
+      "alias": "spare-vm",
+      "status": "unavailable",
+      "stale": false,
+      "reason": "SSH snapshot timed out",
+      "snapshot": null
+    }
+  ]
+}
