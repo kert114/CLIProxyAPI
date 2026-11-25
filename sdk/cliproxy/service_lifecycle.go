@@ -39,24 +39,28 @@ func (s *Service) Run(ctx context.Context) error {
 		ctx = context.Background()
 	}
 	ctx, runCancel := context.WithCancel(ctx)
+	// The caller can cancel Run to start shutdown while HTTP requests still
+	// need the runtime workers. Shutdown cancels them after the opt-in drain.
+	runtimeCtx, runtimeCancel := context.WithCancel(context.WithoutCancel(ctx))
 	s.cfgMu.Lock()
-	s.antigravityContext = ctx
+	s.antigravityContext = runtimeCtx
 	s.cfgMu.Unlock()
 	s.homeMu.Lock()
 	s.runCancel = runCancel
+	s.runtimeCancel = runtimeCancel
 	s.homeMu.Unlock()
 	defer func() {
 		runCancel()
+		runtimeCancel()
 		s.homeMu.Lock()
-		if s.runCancel != nil {
-			s.runCancel = nil
-		}
+		s.runCancel = nil
+		s.runtimeCancel = nil
 		s.homeMu.Unlock()
 	}()
 
-	s.startModelCatalogUpdaters(ctx)
+	s.startModelCatalogUpdaters(runtimeCtx)
 
-	usage.StartDefault(ctx)
+	usage.StartDefault(runtimeCtx)
 	cfg := s.currentConfig()
 	homeEnabled := cfg != nil && cfg.Home.Enabled
 	if homeEnabled {
@@ -102,7 +106,7 @@ func (s *Service) Run(ctx context.Context) error {
 			auths:           s.coreManager.List(),
 		})
 		interval := 15 * time.Minute
-		s.coreManager.StartAutoRefresh(ctx, interval)
+		s.coreManager.StartAutoRefresh(runtimeCtx, interval)
 		log.Infof("core auth auto-refresh started (interval=%s)", interval)
 	}
 
@@ -149,7 +153,7 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	if homeEnabled {
-		s.startHomeSubscriber(ctx)
+		s.startHomeSubscriber(runtimeCtx)
 	}
 
 	if s.server != nil && s.wsGateway != nil {
@@ -213,7 +217,7 @@ func (s *Service) Run(ctx context.Context) error {
 			return fmt.Errorf("cliproxy: failed to create watcher: %w", errCreate)
 		}
 		s.setWatcher(watcherWrapper)
-		s.ensureAuthUpdateQueue(ctx)
+		s.ensureAuthUpdateQueue(runtimeCtx)
 		if s.authUpdates != nil {
 			watcherWrapper.SetAuthUpdateQueue(s.authUpdates)
 		}
@@ -235,7 +239,7 @@ func (s *Service) Run(ctx context.Context) error {
 
 	s.registerModelRefreshCallback()
 	if !homeEnabled {
-		go s.runAntigravityModelRefresh(ctx)
+		go s.runAntigravityModelRefresh(runtimeCtx)
 	}
 
 	select {
@@ -266,11 +270,30 @@ func (s *Service) Shutdown(ctx context.Context) error {
 			ctx = context.Background()
 		}
 
+		drainTimeout := s.server.ShutdownTimeoutSeconds()
+		stopServer := func() {
+			if errStop := s.server.StopWithDrainTimeout(ctx, drainTimeout); errStop != nil {
+				log.Errorf("error stopping API server: %v", errStop)
+				if shutdownErr == nil {
+					shutdownErr = errStop
+				}
+			}
+		}
+		if drainTimeout > 0 {
+			// Close the proxy listeners before waiting on pprof or stopping
+			// resources used by active requests, including the WebSocket relay.
+			stopServer()
+		}
+
 		s.homeMu.Lock()
 		runCancel := s.runCancel
+		runtimeCancel := s.runtimeCancel
 		s.homeMu.Unlock()
 		if runCancel != nil {
 			runCancel()
+		}
+		if runtimeCancel != nil {
+			runtimeCancel()
 		}
 
 		s.homeLifecycleMu.Lock()
@@ -333,7 +356,9 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		if watcher := s.currentWatcher(); watcher != nil {
 			if err := watcher.Stop(); err != nil {
 				log.Errorf("failed to stop file watcher: %v", err)
-				shutdownErr = err
+				if shutdownErr == nil {
+					shutdownErr = err
+				}
 			}
 		}
 		if s.wsGateway != nil {
@@ -365,13 +390,8 @@ func (s *Service) Shutdown(ctx context.Context) error {
 
 		// no legacy clients to persist
 
-		if s.server != nil {
-			if errStop := s.server.Stop(ctx); errStop != nil {
-				log.Errorf("error stopping API server: %v", errStop)
-				if shutdownErr == nil {
-					shutdownErr = errStop
-				}
-			}
+		if s.server != nil && drainTimeout <= 0 {
+			stopServer()
 		}
 
 		if s.pluginHost != nil {

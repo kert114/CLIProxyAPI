@@ -412,6 +412,14 @@ func (s *Server) Start() error {
 	}
 }
 
+// ShutdownTimeoutSeconds returns the drain budget from the active server config.
+func (s *Server) ShutdownTimeoutSeconds() int {
+	if cfg := s.getConfig(); cfg != nil {
+		return cfg.ShutdownTimeoutSeconds
+	}
+	return 0
+}
+
 // Stop closes listeners and shuts down the API server.
 // When server.shutdown-timeout is a positive number of seconds, Stop first lets
 // in-flight requests finish within that budget (http.Server.Shutdown), then
@@ -424,6 +432,12 @@ func (s *Server) Start() error {
 // Returns:
 //   - error: An error if the server fails to stop
 func (s *Server) Stop(ctx context.Context) error {
+	return s.StopWithDrainTimeout(ctx, s.ShutdownTimeoutSeconds())
+}
+
+// StopWithDrainTimeout uses a caller's snapshot of the shutdown timeout so the
+// drain budget matches the service's teardown order even during a config reload.
+func (s *Server) StopWithDrainTimeout(ctx context.Context, drainTimeout int) error {
 	log.Debug("Stopping API server...")
 
 	if s.keepAliveEnabled {
@@ -454,10 +468,6 @@ func (s *Server) Stop(ctx context.Context) error {
 	// immediately without graceful draining.
 	var errCloseServer error
 	if s.server != nil {
-		drainTimeout := 0
-		if cfg := s.getConfig(); cfg != nil {
-			drainTimeout = cfg.ShutdownTimeoutSeconds
-		}
 		if drainTimeout > 0 {
 			// Bound the drain by the configured timeout even when the caller's
 			// context is more generous: shutdown must never hang longer than the

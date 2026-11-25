@@ -133,6 +133,7 @@ type Service struct {
 	homeDrainBound               time.Duration
 	homeCancel                   context.CancelFunc
 	runCancel                    context.CancelFunc
+	runtimeCancel                context.CancelFunc
 	homeLogForwarder             homeLogForwarder
 	homeLogForwarderClient       *home.Client
 	homePluginSyncMu             sync.Mutex
