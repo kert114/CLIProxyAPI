@@ -14,6 +14,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/shutdown"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v8/sdk/access"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
@@ -70,12 +71,9 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	defer func() {
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer shutdownCancel()
-		timeout := s.ShutdownTimeout()
-		if errShutdown := s.ShutdownWithBudget(shutdownCtx, timeout); errShutdown != nil {
-			if timeout > 0 {
-				go log.Errorf("service shutdown returned error: %v", errShutdown)
+		if errShutdown := s.shutdownWithBudget(context.Background(), s.ShutdownTimeout(), true); errShutdown != nil {
+			if s.shutdownState.Load().budget > 0 {
+				shutdown.RunDetached(func() { log.Errorf("service shutdown returned error: %v", errShutdown) })
 			} else {
 				log.Errorf("service shutdown returned error: %v", errShutdown)
 			}
@@ -120,6 +118,9 @@ func (s *Service) Run(ctx context.Context) error {
 		if tokenResult == nil {
 			tokenResult = &TokenClientResult{}
 		}
+		if s.admissionStopped() {
+			return context.Canceled
+		}
 
 		apiKeyResult, err := s.apiKeyProvider.Load(ctx, cfg)
 		if err != nil && !errors.Is(err, context.Canceled) {
@@ -128,6 +129,9 @@ func (s *Service) Run(ctx context.Context) error {
 		if apiKeyResult == nil {
 			apiKeyResult = &APIKeyClientResult{}
 		}
+	}
+	if s.admissionStopped() {
+		return context.Canceled
 	}
 
 	// legacy clients removed; no caches to refresh
@@ -153,6 +157,9 @@ func (s *Service) Run(ctx context.Context) error {
 		s.admissionMu.Unlock()
 	}
 	s.syncPluginRuntimeConfig(ctx)
+	if s.admissionStopped() {
+		return context.Canceled
+	}
 	if homeEnabled {
 		s.configRuntimeMu.Lock()
 		s.syncPluginModelRuntime(ctx)
@@ -190,6 +197,9 @@ func (s *Service) Run(ctx context.Context) error {
 	if s.hooks.OnBeforeStart != nil {
 		s.hooks.OnBeforeStart(s.currentConfig())
 	}
+	if s.admissionStopped() {
+		return context.Canceled
+	}
 
 	s.serverErr = make(chan error, 1)
 	go func() {
@@ -206,6 +216,10 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	s.configRuntimeMu.Lock()
+	if s.admissionStopped() {
+		s.configRuntimeMu.Unlock()
+		return context.Canceled
+	}
 	currentCfg := s.currentConfig()
 	s.applyPprofConfig(currentCfg)
 	s.applyDiscoveryConfig(currentCfg)
@@ -214,11 +228,19 @@ func (s *Service) Run(ctx context.Context) error {
 	if s.hooks.OnAfterStart != nil {
 		s.hooks.OnAfterStart(s)
 	}
+	if s.admissionStopped() {
+		return context.Canceled
+	}
 
 	if !homeEnabled {
 		reloadCallback := func(newCfg *config.Config) {
+			if s.admissionStopped() {
+				return
+			}
 			if newCfg != nil && newCfg.ShutdownTimeoutSeconds > 0 {
-				s.applyConfigUpdateWithAuthSynthesis(ctx, newCfg, false)
+				if ctx.Err() == nil {
+					s.applyConfigUpdateWithAuthSynthesis(ctx, newCfg, false)
+				}
 			} else {
 				s.applyWatcherConfigUpdate(newCfg)
 			}
@@ -241,28 +263,50 @@ func (s *Service) Run(ctx context.Context) error {
 			if errCreate != nil {
 				return fmt.Errorf("cliproxy: failed to create watcher: %w", errCreate)
 			}
-			s.setWatcher(watcherWrapper)
+			if !s.setWatcher(watcherWrapper) {
+				shutdown.RunDetached(func() { _ = watcherWrapper.Stop() })
+				return context.Canceled
+			}
 		}
 		s.ensureAuthUpdateQueue(ctx)
-		if s.authUpdates != nil {
-			watcherWrapper.SetAuthUpdateQueue(s.authUpdates)
+		s.cfgMu.RLock()
+		authUpdates := s.authUpdates
+		s.cfgMu.RUnlock()
+		if s.admissionStopped() {
+			return context.Canceled
+		}
+		if authUpdates != nil {
+			watcherWrapper.SetAuthUpdateQueue(authUpdates)
 		}
 		watcherWrapper.SetConfig(s.currentConfig())
 		s.registerPluginAuthParser()
 
 		watcherCtx, watcherCancel := context.WithCancel(context.Background())
 		s.cfgMu.Lock()
+		if s.admissionStopped() {
+			s.cfgMu.Unlock()
+			watcherCancel()
+			return context.Canceled
+		}
 		s.watcherCancel = watcherCancel
 		s.cfgMu.Unlock()
 		if errStart := watcherWrapper.Start(watcherCtx); errStart != nil {
 			return fmt.Errorf("cliproxy: failed to start watcher: %w", errStart)
 		}
+		if s.admissionStopped() {
+			return context.Canceled
+		}
 		log.Info("file watcher started for config and auth directory changes")
 		s.configRuntimeMu.Lock()
-		s.syncPluginModelRuntime(ctx)
+		if !s.admissionStopped() {
+			s.syncPluginModelRuntime(ctx)
+		}
 		s.configRuntimeMu.Unlock()
 	}
 
+	if s.admissionStopped() {
+		return context.Canceled
+	}
 	s.registerModelRefreshCallback()
 	if !homeEnabled {
 		go s.runAntigravityModelRefresh(ctx)
@@ -283,19 +327,47 @@ func (s *Service) Run(ctx context.Context) error {
 // The unbuffered result transfers ownership only if startup is still waiting.
 func (s *Service) createDrainableWatcher(ctx context.Context, authDir string, reload func(*config.Config)) (*WatcherWrapper, error) {
 	type result struct {
-		watcher *WatcherWrapper
-		err     error
+		watcher    *WatcherWrapper
+		err        error
+		panicValue any
 	}
 	created := make(chan result)
-	go func() {
-		watcher, err := s.watcherFactory(s.configPath, authDir, reload)
-		select {
-		case created <- result{watcher, err}:
-		case <-ctx.Done():
-			_ = watcher.Stop()
-		case <-s.admissionClosed:
-			_ = watcher.Stop()
+	accepted, abandoned := make(chan struct{}), make(chan struct{})
+	keepWatcher := false
+	defer func() {
+		if keepWatcher {
+			close(accepted)
+		} else {
+			close(abandoned)
 		}
+	}()
+	go func() {
+		defer func() {
+			if value := recover(); value != nil {
+				select {
+				case created <- result{panicValue: value}:
+				case <-abandoned:
+				}
+			}
+		}()
+		watcher, err := s.watcherFactory(s.configPath, authDir, func(cfg *config.Config) {
+			select {
+			case <-abandoned:
+				return
+			default:
+				reload(cfg)
+			}
+		})
+		select {
+		case created <- result{watcher: watcher, err: err}:
+			select {
+			case <-accepted:
+				return
+			case <-abandoned:
+			}
+		case <-abandoned:
+		}
+		_ = watcher.Stop()
 	}()
 
 	select {
@@ -304,21 +376,41 @@ func (s *Service) createDrainableWatcher(ctx context.Context, authDir string, re
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case result := <-created:
+		if result.panicValue != nil {
+			panic(result.panicValue)
+		}
 		if result.err != nil {
-			_ = result.watcher.Stop()
 			return nil, fmt.Errorf("cliproxy: failed to create watcher: %w", result.err)
 		}
-		s.cfgMu.Lock()
-		select {
-		case <-s.admissionClosed:
-			s.cfgMu.Unlock()
-			_ = result.watcher.Stop()
-			return nil, context.Canceled
-		default:
-			s.watcher = result.watcher
-			s.cfgMu.Unlock()
-			return result.watcher, nil
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
+		if !s.setWatcher(result.watcher) {
+			return nil, context.Canceled
+		}
+		keepWatcher = true
+		return result.watcher, nil
+	}
+}
+
+func (s *Service) admissionStopped() bool {
+	select {
+	case <-s.admissionClosed:
+		return true
+	default:
+		return false
+	}
+}
+
+type shutdownResult struct {
+	err        error
+	panicValue any
+}
+
+func (r *shutdownResult) recoverPanic() {
+	if value := recover(); value != nil {
+		r.panicValue = value
+		r.err = errors.New("cliproxy: shutdown callback panicked")
 	}
 }
 
@@ -347,6 +439,10 @@ func (s *Service) Shutdown(ctx context.Context) error {
 // ShutdownWithBudget uses a snapshot of ShutdownTimeout. The standalone
 // command uses the same snapshot for its process exit timer and HTTP drain.
 func (s *Service) ShutdownWithBudget(ctx context.Context, budget time.Duration) error {
+	return s.shutdownWithBudget(ctx, budget, false)
+}
+
+func (s *Service) shutdownWithBudget(ctx context.Context, budget time.Duration, fromRun bool) error {
 	if s == nil {
 		return nil
 	}
@@ -354,9 +450,16 @@ func (s *Service) ShutdownWithBudget(ctx context.Context, budget time.Duration) 
 		ctx = context.Background()
 	}
 	state := s.shutdownState.Load()
+	initiator := false
 	if state == nil {
+		if fromRun && budget <= 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, 30*time.Second)
+			defer cancel()
+		}
 		state = &serviceShutdown{budget: budget, ctx: ctx}
-		if !s.shutdownState.CompareAndSwap(nil, state) {
+		initiator = s.shutdownState.CompareAndSwap(nil, state)
+		if !initiator {
 			state = s.shutdownState.Load()
 		}
 	}
@@ -367,6 +470,9 @@ func (s *Service) ShutdownWithBudget(ctx context.Context, budget time.Duration) 
 	}
 
 	state.once.Do(func() {
+		drainCtx, cancel := context.WithTimeout(state.ctx, state.budget)
+		state.drainCtx = drainCtx
+
 		s.admissionMu.Lock()
 		server := s.server
 		if server != nil {
@@ -376,32 +482,65 @@ func (s *Service) ShutdownWithBudget(ctx context.Context, budget time.Duration) 
 			close(s.admissionClosed)
 		}
 		s.admissionMu.Unlock()
+		s.closePprofListeners()
+		if s.discoveryManager != nil {
+			s.discoveryManager.stopAccepting()
+		}
 
 		state.done = make(chan struct{})
-		drainCtx, cancel := context.WithTimeout(state.ctx, state.budget)
 		go func() {
-			defer close(state.done)
 			defer cancel()
-			profileDone := make(chan error, 1)
-			go func() { profileDone <- s.stopPprofForDrain(drainCtx) }()
+			defer close(state.done)
+			defer state.result.recoverPanic()
+			profileDone := make(chan shutdownResult, 1)
+			go func() {
+				var result shutdownResult
+				defer func() { profileDone <- result }()
+				defer result.recoverPanic()
+				if s.pprofServer != nil {
+					result.err = s.pprofServer.shutdown(drainCtx, false)
+				}
+			}()
 			var errDrain error
 			if server != nil {
 				errDrain = server.Drain(drainCtx)
 			}
 			// Leave the relay and request dependencies alive until HTTP has drained.
-			state.err = errors.Join(errDrain, <-profileDone, s.shutdownResources(drainCtx, false))
+			profile := <-profileDone
+			state.result.err = errors.Join(errDrain, profile.err, s.shutdownResources(drainCtx, false))
+			if profile.panicValue != nil {
+				panic(profile.panicValue)
+			}
 		}()
 	})
 
+	if fromRun {
+		// Closing the listener wakes Run. Join the already-started drain
+		// before its deferred runCancel stops workers serving that drain.
+		ctx = state.drainCtx
+	}
+	result := func() error {
+		if initiator && state.result.panicValue != nil && (fromRun || ctx.Err() == nil) {
+			panic(state.result.panicValue)
+		}
+		return state.result.err
+	}
 	select {
 	case <-state.done:
-		return state.err
+		return result()
 	default:
 	}
 	select {
 	case <-state.done:
-		return state.err
+		return result()
 	case <-ctx.Done():
+		if fromRun {
+			select {
+			case <-state.done:
+				return result()
+			default:
+			}
+		}
 		return ctx.Err()
 	}
 }
@@ -487,9 +626,12 @@ func (s *Service) shutdownResources(ctx context.Context, stopAPI bool) error {
 			}
 		}
 	}
-	if s.authQueueStop != nil {
-		s.authQueueStop()
-		s.authQueueStop = nil
+	s.cfgMu.Lock()
+	stopQueue := s.authQueueStop
+	s.authQueueStop = nil
+	s.cfgMu.Unlock()
+	if stopQueue != nil {
+		stopQueue()
 	}
 
 	if stopAPI {

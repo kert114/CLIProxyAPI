@@ -89,6 +89,7 @@ func standaloneSignalContext(initialBudget time.Duration) (context.Context, func
 	ready := make(chan struct{})
 	exiting := make(chan struct{})
 	finished := make(chan struct{})
+	var shutdownPanic any
 	go func() {
 		defer close(finished)
 		select {
@@ -121,7 +122,12 @@ func standaloneSignalContext(initialBudget time.Duration) (context.Context, func
 					return
 				}
 			}
-			_ = current.ShutdownWithBudget(context.Background(), budget)
+			func() {
+				// Report a teardown panic to the Run caller through finish.
+				// Keep the watchdog armed until that caller unwinds.
+				defer func() { shutdownPanic = recover() }()
+				_ = current.ShutdownWithBudget(context.Background(), budget)
+			}()
 			cancel(cause)
 			<-exiting
 		}
@@ -136,6 +142,9 @@ func standaloneSignalContext(initialBudget time.Duration) (context.Context, func
 		signal.Stop(signals)
 		close(exiting)
 		<-finished
+		if shutdownPanic != nil {
+			panic(shutdownPanic)
+		}
 	}
 	return ctx, publish, finish
 }

@@ -130,3 +130,67 @@ func TestServerStop_DeadlineLogging(t *testing.T) {
 		t.Error("deadline warning blocked transport closure")
 	}
 }
+
+type holdAPIStartupLog struct {
+	addr    string
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (*holdAPIStartupLog) Levels() []log.Level { return []log.Level{log.DebugLevel} }
+
+func (h *holdAPIStartupLog) Fire(entry *log.Entry) error {
+	if entry.Message == "Starting API server on "+h.addr {
+		close(h.entered)
+		<-h.release
+	}
+	return nil
+}
+
+func TestServerStop_PositiveBudgetClosesListenerBeforeZeroModeStartupPublishesMux(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := listener.Addr().String()
+	_ = listener.Close()
+
+	hook := &holdAPIStartupLog{addr: addr, entered: make(chan struct{}), release: make(chan struct{})}
+	logger := log.StandardLogger()
+	hooks := logger.ReplaceHooks(make(log.LevelHooks))
+	defer logger.ReplaceHooks(hooks)
+	level := logger.GetLevel()
+	logger.SetLevel(log.DebugLevel)
+	defer logger.SetLevel(level)
+	logger.AddHook(hook)
+
+	server := &Server{server: &http.Server{Addr: addr}}
+	done := make(chan error, 1)
+	go func() { done <- server.Start() }()
+	defer func() {
+		close(hook.release)
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Error(err)
+			}
+		case <-time.After(time.Second):
+			t.Error("API startup did not unwind")
+		}
+	}()
+	select {
+	case <-hook.entered:
+	case <-time.After(time.Second):
+		t.Fatal("API startup did not reach the hook after binding the socket")
+	}
+	expired, cancel := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+	defer cancel()
+	if err := server.StopWithDrainTimeout(expired, 1); err != nil {
+		t.Fatal(err)
+	}
+	rebound, err := net.Listen("tcp4", addr)
+	if err != nil {
+		t.Fatalf("API socket remained bound after shutdown: %v", err)
+	}
+	_ = rebound.Close()
+}

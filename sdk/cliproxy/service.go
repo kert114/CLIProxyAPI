@@ -110,7 +110,8 @@ type Service struct {
 	// pluginHost owns dynamic plugin lifecycle and runtime capability adapters.
 	pluginHost *pluginhost.Host
 
-	// Admission protects only publication and closure of the native API listener.
+	// Admission protects publication and closure of the native API listener.
+	// Closing admission also fences positive-mode configuration and startup work.
 	admissionMu     sync.Mutex
 	admissionClosed chan struct{}
 	shutdownConfig  atomic.Pointer[config.Config]
@@ -157,11 +158,12 @@ type Service struct {
 }
 
 type serviceShutdown struct {
-	budget time.Duration
-	ctx    context.Context
-	once   sync.Once
-	done   chan struct{}
-	err    error // published by closing done
+	budget   time.Duration
+	ctx      context.Context
+	once     sync.Once
+	drainCtx context.Context
+	done     chan struct{}
+	result   shutdownResult // published by closing done
 }
 
 // SetResultPolicy sets an execution result policy on the underlying core auth manager.

@@ -356,7 +356,6 @@ func (s *Server) Start() error {
 		_ = raw.Close()
 		return nil
 	}
-	s.rawListener = raw
 	s.muxBaseListener = listener
 	s.muxHTTPListener = httpListener
 	s.listenerMu.Unlock()
@@ -425,12 +424,9 @@ func (s *Server) Start() error {
 	}
 }
 
-// listen publishes a positive-mode listener before TLS setup or logging can
-// block. Only the native TCP bind runs under the listener lock.
+// listen publishes the listener before TLS setup or logging can block. A
+// service that starts at zero can enable draining before startup finishes.
 func (s *Server) listen(addr string) (net.Listener, error) {
-	if cfg := s.getConfig(); cfg == nil || cfg.ShutdownTimeoutSeconds <= 0 {
-		return net.Listen("tcp", addr)
-	}
 	tcpAddr, err := net.ResolveTCPAddr("tcp", addr)
 	if err != nil {
 		return nil, err
@@ -487,7 +483,7 @@ func (s *Server) StopWithDrainTimeout(ctx context.Context, seconds int) error {
 	drainCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < budget {
-		go log.Warn("HTTP drain limited by shutdown context deadline")
+		shutdown.RunDetached(func() { log.Warn("HTTP drain limited by shutdown context deadline") })
 	}
 	return s.Drain(drainCtx)
 }
@@ -530,7 +526,10 @@ func (s *Server) Drain(ctx context.Context) error {
 		}
 	}
 	if errors.Is(errShutdown, context.DeadlineExceeded) || errors.Is(errShutdown, context.Canceled) {
-		go log.WithError(errShutdown).Warn("HTTP drain ended before all requests finished, closing remaining connections")
+		errDrain := errShutdown
+		shutdown.RunDetached(func() {
+			log.WithError(errDrain).Warn("HTTP drain ended before all requests finished, closing remaining connections")
+		})
 		errShutdown = nil
 	}
 	if s.codexLiveHandler != nil {

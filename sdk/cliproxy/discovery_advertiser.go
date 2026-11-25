@@ -36,6 +36,7 @@ func (r *discoveryRefresh) stopAndWait() {
 
 type discoveryAdvertiserManager struct {
 	mu              sync.Mutex
+	listeners       discovery.Listeners
 	advertiser      discovery.Advertiser
 	enabled         bool
 	lastSpec        discovery.ServiceSpec
@@ -56,14 +57,9 @@ type discoveryAdvertiserManager struct {
 	buildSpec       func(*config.Config, int, bool) (discovery.ServiceSpec, error)
 }
 
-func newZeroconfAdvertiser() discovery.Advertiser {
-	return discovery.NewZeroconfAdvertiser()
-}
-
 func newDiscoveryAdvertiserManager() *discoveryAdvertiserManager {
 	return &discoveryAdvertiserManager{
-		newAdvertiser: newZeroconfAdvertiser,
-		buildSpec:     discovery.BuildServiceSpec,
+		buildSpec: discovery.BuildServiceSpec,
 	}
 }
 
@@ -229,7 +225,7 @@ func (m *discoveryAdvertiserManager) applyContext(ctx context.Context, cfg *conf
 		_ = oldAdv.Stop()
 	}
 	if newAdvertiser == nil {
-		newAdvertiser = newZeroconfAdvertiser
+		newAdvertiser = m.listeners.NewAdvertiser
 	}
 	adv := newAdvertiser()
 	var errStart error
@@ -303,6 +299,13 @@ func (m *discoveryAdvertiserManager) Shutdown() error {
 		return oldAdv.Stop()
 	}
 	return nil
+}
+
+func (m *discoveryAdvertiserManager) stopAccepting() {
+	m.mu.Lock()
+	m.closed = true
+	m.mu.Unlock()
+	m.listeners.Close()
 }
 
 func (m *discoveryAdvertiserManager) refreshPeriod() (time.Duration, bool) {

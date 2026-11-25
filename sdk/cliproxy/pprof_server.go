@@ -3,6 +3,7 @@ package cliproxy
 import (
 	"context"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/pprof"
 	"strings"
@@ -14,12 +15,13 @@ import (
 )
 
 type pprofServer struct {
-	mu      sync.Mutex
-	server  *http.Server
-	addr    string
-	enabled bool
-	owner   uint64
-	stopped bool
+	mu        sync.Mutex
+	server    *http.Server
+	listeners map[*http.Server]*net.TCPListener
+	addr      string
+	enabled   bool
+	owner     uint64
+	stopped   bool
 }
 
 func newPprofServer() *pprofServer {
@@ -119,18 +121,24 @@ func (p *pprofServer) ApplyContext(ctx context.Context, cfg *config.Config) bool
 	return true
 }
 
-// stopPprofForDrain prevents a concurrent reload from reopening pprof.
-func (s *Service) stopPprofForDrain(ctx context.Context) error {
+// closePprofListeners fences concurrent startup and reload, including servers
+// a reload has detached but has yet to stop. Active profiles can finish later.
+func (s *Service) closePprofListeners() {
 	if p := s.pprofServer; p != nil {
 		p.mu.Lock()
 		p.stopped = true
+		for _, listener := range p.listeners {
+			_ = listener.Close()
+		}
 		p.mu.Unlock()
-		return p.Shutdown(ctx)
 	}
-	return nil
 }
 
 func (p *pprofServer) Shutdown(ctx context.Context) error {
+	return p.shutdown(ctx, true)
+}
+
+func (p *pprofServer) shutdown(ctx context.Context, legacy bool) error {
 	if p == nil {
 		return nil
 	}
@@ -145,7 +153,10 @@ func (p *pprofServer) Shutdown(ctx context.Context) error {
 	if currentServer == nil {
 		return nil
 	}
-	return p.stopServerWithContext(ctx, currentServer, currentAddr, "shutdown")
+	if legacy {
+		return p.stopServerWithContext(ctx, currentServer, currentAddr, "shutdown")
+	}
+	return shutdownPprofServer(ctx, currentServer, currentAddr, "shutdown")
 }
 
 func (p *pprofServer) startServer(addr string, owner uint64) *http.Server {
@@ -166,7 +177,7 @@ func (p *pprofServer) startServer(addr string, owner uint64) *http.Server {
 
 	log.Infof("pprof server starting on %s", addr)
 	go func() {
-		if errServe := server.ListenAndServe(); errServe != nil && !errors.Is(errServe, http.ErrServerClosed) {
+		if errServe := p.serve(server); errServe != nil && !errors.Is(errServe, net.ErrClosed) && !errors.Is(errServe, http.ErrServerClosed) {
 			log.Errorf("pprof server failed on %s: %v", addr, errServe)
 			p.clearFailedServer(server)
 		}
@@ -174,8 +185,36 @@ func (p *pprofServer) startServer(addr string, owner uint64) *http.Server {
 	return server
 }
 
+func (p *pprofServer) serve(server *http.Server) error {
+	addr, err := net.ResolveTCPAddr("tcp", server.Addr)
+	if err != nil {
+		return err
+	}
+	p.mu.Lock()
+	if p.stopped || p.server != server {
+		p.mu.Unlock()
+		return http.ErrServerClosed
+	}
+	listener, err := net.ListenTCP("tcp", addr)
+	if err != nil {
+		p.mu.Unlock()
+		return err
+	}
+	if p.listeners == nil {
+		p.listeners = make(map[*http.Server]*net.TCPListener)
+	}
+	p.listeners[server] = listener
+	p.mu.Unlock()
+	defer func() {
+		p.mu.Lock()
+		delete(p.listeners, server)
+		p.mu.Unlock()
+	}()
+	return server.Serve(listener)
+}
+
 // clearFailedServer removes a failed physical server even if a same-address
-// ApplyContext transferred lifecycle ownership while ListenAndServe was starting.
+// ApplyContext transferred lifecycle ownership while it was starting.
 func (p *pprofServer) clearFailedServer(server *http.Server) {
 	if p == nil || server == nil {
 		return
@@ -215,7 +254,11 @@ func (p *pprofServer) stopServerWithContext(ctx context.Context, server *http.Se
 	}
 	stopCtx, cancel := context.WithTimeout(stopCtx, 5*time.Second)
 	defer cancel()
-	if errStop := server.Shutdown(stopCtx); errStop != nil {
+	return shutdownPprofServer(stopCtx, server, addr, reason)
+}
+
+func shutdownPprofServer(ctx context.Context, server *http.Server, addr string, reason string) error {
+	if errStop := server.Shutdown(ctx); errStop != nil {
 		log.Errorf("pprof server stop failed on %s: %v", addr, errStop)
 		return errStop
 	}

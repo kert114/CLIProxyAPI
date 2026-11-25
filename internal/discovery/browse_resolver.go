@@ -470,8 +470,8 @@ func browseLAN(ctx context.Context, ifaces []net.Interface, serviceType, domain 
 		return nil, fmt.Errorf("discovery: no allowed browse interfaces")
 	}
 	cache := newBrowseCache(ifaces, serviceType, domain)
-	conn4, err4 := openMDNSConn4(ifaces)
-	conn6, err6 := openMDNSConn6(ifaces)
+	conn4, err4 := openMDNSConn4(ifaces, net.ListenUDP)
+	conn6, err6 := openMDNSConn6(ifaces, net.ListenUDP)
 	// Interface and destination metadata are mandatory for receive isolation.
 	if conn4 != nil {
 		if err := conn4.SetControlMessage(ipv4.FlagInterface|ipv4.FlagDst, true); err != nil {
