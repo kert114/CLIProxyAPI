@@ -113,10 +113,6 @@ type Auth struct {
 	// Runtime carries non-serialisable data used during execution (in-memory only).
 	Runtime any `json:"-"`
 
-	// RuntimeLifetime fences ephemeral credentials against late registration
-	// after the connection that supplied them has closed.
-	RuntimeLifetime <-chan struct{} `json:"-"`
-
 	// RejectedAccessToken tracks the access token rejected by upstream 401 until a refresh succeeds.
 	RejectedAccessToken string `json:"-"`
 	// RejectedSIWCAccessToken tracks the nested SIWC access token rejected by upstream 401 until replaced.
@@ -475,15 +471,6 @@ func (a *Auth) RecentRequestsSnapshot(now time.Time) []RecentRequestBucket {
 	}
 
 	return out
-}
-
-func (a *Auth) runtimeExpired() bool {
-	select {
-	case <-a.RuntimeLifetime:
-		return true
-	default:
-		return false
-	}
 }
 
 // Clone shallow copies the Auth structure, duplicating maps to avoid accidental mutation.

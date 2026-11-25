@@ -168,16 +168,11 @@ func (h *Handler) currentMediaRelay() (mediaRelayFactory, error) {
 
 // Close releases all active Codex live sessions.
 func (h *Handler) Close() {
-	h.CloseContext(context.Background())
-}
-
-// CloseContext releases active sessions and waits for their cleanup within ctx.
-func (h *Handler) CloseContext(ctx context.Context) {
 	if h == nil {
 		return
 	}
 	if h.sessions != nil {
-		h.sessions.closeAllContext(ctx, "server_stopped")
+		h.sessions.closeAll("server_stopped")
 	}
 	if h.clientSecrets != nil {
 		h.clientSecrets.close()

@@ -80,9 +80,8 @@ type Service struct {
 	// kvStoreManaged tracks whether this service instance owns local KVStore lifecycle.
 	kvStoreManaged atomic.Bool
 
-	// Positive shutdown fences startup publication under cfgMu.
-	stopping      bool
-	cancelStartup context.CancelFunc
+	// serverErr channel for server startup/shutdown errors.
+	serverErr chan error
 
 	// watcher handles file system monitoring.
 	watcher *WatcherWrapper
@@ -111,9 +110,11 @@ type Service struct {
 	// pluginHost owns dynamic plugin lifecycle and runtime capability adapters.
 	pluginHost *pluginhost.Host
 
-	// shutdownOnce elects one shutdown caller and publishes its completion signal.
-	shutdownOnce sync.Once
-	shutdownDone chan struct{}
+	// Admission protects only publication and closure of the native API listener.
+	admissionMu     sync.Mutex
+	admissionClosed chan struct{}
+	shutdownConfig  atomic.Pointer[config.Config]
+	shutdownState   atomic.Pointer[serviceShutdown]
 
 	// wsGateway manages websocket Gemini providers.
 	wsGateway *wsrelay.Manager
@@ -135,8 +136,6 @@ type Service struct {
 	homeDrainBound               time.Duration
 	homeCancel                   context.CancelFunc
 	runCancel                    context.CancelFunc
-	runtimeCancel                context.CancelFunc
-	runDrainTimeout              func() int
 	homeLogForwarder             homeLogForwarder
 	homeLogForwarderClient       *home.Client
 	homePluginSyncMu             sync.Mutex
@@ -155,6 +154,14 @@ type Service struct {
 	antigravityRefreshPending map[string]*antigravityModelRefreshRequest
 	antigravityPersistPending map[string]*antigravityHintPersistRequest
 	antigravityPersistActive  map[string]*antigravityHintPersistRequest
+}
+
+type serviceShutdown struct {
+	budget time.Duration
+	ctx    context.Context
+	once   sync.Once
+	done   chan struct{}
+	err    error // published by closing done
 }
 
 // SetResultPolicy sets an execution result policy on the underlying core auth manager.

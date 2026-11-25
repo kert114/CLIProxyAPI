@@ -221,7 +221,7 @@ func (f *rebalanceAdmissionForwarder) Bind(client *home.Client) { f.bound <- cli
 func (f *rebalanceAdmissionForwarder) Deactivate(client *home.Client) {
 	f.detached <- client
 }
-func (f *rebalanceAdmissionForwarder) StopContext(context.Context) {}
+func (f *rebalanceAdmissionForwarder) Stop() {}
 
 func awaitRebalanceEvent[T any](t *testing.T, events <-chan T) T {
 	t.Helper()

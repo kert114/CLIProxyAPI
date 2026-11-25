@@ -35,20 +35,11 @@ func (h *Host) RegisterUsagePlugins() {
 	}
 }
 
-var thinkingOwner struct {
-	sync.Mutex
-	host *Host
-}
-
 func (h *Host) refreshThinkingProviders(records []capabilityRecord) {
-	if h == nil || h.sharedRuntimeRetired.Load() {
+	thinking.ClearPluginProviders()
+	if h == nil {
 		return
 	}
-	type registration struct {
-		adapter  *thinkingAdapter
-		priority int
-	}
-	var providers []registration
 	for _, record := range records {
 		applier := record.plugin.Capabilities.ThinkingApplier
 		if applier == nil || h.isPluginFused(record.id) {
@@ -58,26 +49,15 @@ func (h *Host) refreshThinkingProviders(records []capabilityRecord) {
 		if !okProvider {
 			continue
 		}
-		providers = append(providers, registration{priority: record.priority, adapter: &thinkingAdapter{
+		thinking.RegisterPluginProvider(record.id, provider, record.priority, &thinkingAdapter{
 			host:     h,
 			pluginID: record.id,
 			path:     record.path,
 			version:  record.version,
 			provider: provider,
 			applier:  applier,
-		}})
+		})
 	}
-	thinkingOwner.Lock()
-	defer thinkingOwner.Unlock()
-	if h.sharedRuntimeRetired.Load() {
-		return
-	}
-	thinking.ClearPluginProviders()
-	for _, provider := range providers {
-		adapter := provider.adapter
-		thinking.RegisterPluginProvider(adapter.pluginID, adapter.provider, provider.priority, adapter)
-	}
-	thinkingOwner.host = h
 }
 
 func (h *Host) callThinkingIdentifier(record capabilityRecord, applier pluginapi.ThinkingApplier) (provider string, ok bool) {
@@ -121,11 +101,7 @@ func (h *Host) fusePlugin(id, method string, recovered any) {
 	h.mu.Lock()
 	h.fused[id] = fmt.Sprintf("%s panic: %v", method, recovered)
 	h.mu.Unlock()
-	thinkingOwner.Lock()
-	if thinkingOwner.host == h {
-		thinking.UnregisterPluginProviders(id)
-	}
-	thinkingOwner.Unlock()
+	thinking.UnregisterPluginProviders(id)
 	log.WithField("plugin_id", id).WithField("method", method).Errorf("pluginhost: plugin panic recovered: %v\n%s", recovered, debug.Stack())
 }
 

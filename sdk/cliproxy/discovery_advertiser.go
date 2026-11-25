@@ -2,23 +2,21 @@ package cliproxy
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/discovery"
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/shutdown"
 	log "github.com/sirupsen/logrus"
 )
 
 const defaultDiscoveryRefreshInterval = 15 * time.Second
 
 type discoveryRefresh struct {
-	ctx    context.Context
-	cancel context.CancelFunc
-	done   chan struct{}
+	stop     chan struct{}
+	done     chan struct{}
+	stopOnce sync.Once
 }
 
 type discoveryStart struct {
@@ -30,7 +28,9 @@ func (r *discoveryRefresh) stopAndWait() {
 	if r == nil {
 		return
 	}
-	r.cancel()
+	r.stopOnce.Do(func() {
+		close(r.stop)
+	})
 	<-r.done
 }
 
@@ -94,7 +94,7 @@ func (s *Service) applyDiscoveryConfigContext(ctx context.Context, cfg *config.C
 	return mgr.ApplyContext(ctx, cfg, cfg.Port, cfg.TLS.Enable)
 }
 
-func (s *Service) shutdownDiscovery(ctx context.Context) error {
+func (s *Service) shutdownDiscovery() error {
 	if s == nil {
 		return nil
 	}
@@ -102,7 +102,7 @@ func (s *Service) shutdownDiscovery(ctx context.Context) error {
 	if mgr == nil {
 		return nil
 	}
-	return mgr.shutdown(ctx)
+	return mgr.Shutdown()
 }
 
 func (m *discoveryAdvertiserManager) ApplyContext(ctx context.Context, cfg *config.Config, port int, tlsEnabled bool) bool {
@@ -147,9 +147,7 @@ func (m *discoveryAdvertiserManager) applyContext(ctx context.Context, cfg *conf
 	m.mu.Unlock()
 	if activeStart != nil {
 		activeStart.cancel()
-		if shutdown.Wait(ctx, activeStart.done) != nil {
-			return false
-		}
+		<-activeStart.done
 	}
 
 	m.mu.Lock()
@@ -283,10 +281,6 @@ func (m *discoveryAdvertiserManager) applyContext(ctx context.Context, cfg *conf
 }
 
 func (m *discoveryAdvertiserManager) Shutdown() error {
-	return m.shutdown(context.Background())
-}
-
-func (m *discoveryAdvertiserManager) shutdown(ctx context.Context) error {
 	m.mu.Lock()
 	m.closed = true
 	oldAdv := m.advertiser
@@ -300,35 +294,15 @@ func (m *discoveryAdvertiserManager) shutdown(ctx context.Context) error {
 	m.generation++
 	m.mu.Unlock()
 
-	if ctx.Done() == nil {
-		if activeStart != nil {
-			activeStart.cancel()
-			<-activeStart.done
-		}
-		m.stopRefresh(refreshStop)
-		if oldAdv != nil {
-			return oldAdv.Stop()
-		}
-		return nil
-	}
-
 	if activeStart != nil {
 		activeStart.cancel()
+		<-activeStart.done
 	}
-	if refreshStop != nil {
-		refreshStop.cancel()
-	}
-	var errStop error
+	m.stopRefresh(refreshStop)
 	if oldAdv != nil {
-		errStop = shutdown.Run(ctx, oldAdv.Stop)
+		return oldAdv.Stop()
 	}
-	if activeStart != nil {
-		errStop = errors.Join(errStop, shutdown.Wait(ctx, activeStart.done))
-	}
-	if refreshStop != nil {
-		errStop = errors.Join(errStop, shutdown.Wait(ctx, refreshStop.done))
-	}
-	return errStop
+	return nil
 }
 
 func (m *discoveryAdvertiserManager) refreshPeriod() (time.Duration, bool) {
@@ -348,11 +322,9 @@ func (m *discoveryAdvertiserManager) ensureRefreshLocked() {
 	if m.refresh != nil {
 		return
 	}
-	ctx, cancel := context.WithCancel(context.Background())
 	refresh := &discoveryRefresh{
-		ctx:    ctx,
-		cancel: cancel,
-		done:   make(chan struct{}),
+		stop: make(chan struct{}),
+		done: make(chan struct{}),
 	}
 	m.refresh = refresh
 	interval, _ := m.refreshPeriod()
@@ -379,7 +351,7 @@ func (m *discoveryAdvertiserManager) refreshLoop(refresh *discoveryRefresh, inte
 	defer ticker.Stop()
 	for {
 		select {
-		case <-refresh.ctx.Done():
+		case <-refresh.stop:
 			return
 		case <-ticker.C:
 			m.mu.Lock()
@@ -390,7 +362,7 @@ func (m *discoveryAdvertiserManager) refreshLoop(refresh *discoveryRefresh, inte
 			if cfg == nil || !cfg.Discovery.Enabled {
 				continue
 			}
-			_ = m.applyContext(refresh.ctx, cfg, port, tlsEnabled, refresh)
+			_ = m.applyContext(context.Background(), cfg, port, tlsEnabled, refresh)
 		}
 	}
 }

@@ -5,18 +5,15 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/home"
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/kvstore"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/shutdown"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v8/sdk/access"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
@@ -25,8 +22,6 @@ import (
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	log "github.com/sirupsen/logrus"
 )
-
-const serviceShutdownTimeout = 30 * time.Second
 
 // Run starts the service and blocks until the context is cancelled or the server stops.
 // It initializes all components including authentication, file watching, HTTP server,
@@ -45,119 +40,24 @@ func (s *Service) Run(ctx context.Context) error {
 		ctx = context.Background()
 	}
 	ctx, runCancel := context.WithCancel(ctx)
-	startupCtx, cancelStartup := context.WithCancel(ctx)
-	defer cancelStartup()
-	defer runCancel()
-
-	// Freeze the live shutdown setting when stopping so worker cancellation and
-	// teardown agree, including when a reload changed the mode during Run.
-	var shutdownModeFrozen atomic.Bool
-	drainTimeout := sync.OnceValue(func() int {
-		timeout := s.shutdownTimeoutSeconds()
-		shutdownModeFrozen.Store(true)
-		return timeout
-	})
-	workerTimeout := func() int {
-		if shutdownModeFrozen.Load() {
-			return drainTimeout()
-		}
-		return s.shutdownTimeoutSeconds()
-	}
-	detached, cancelRuntime := context.WithCancelCause(context.WithoutCancel(ctx))
-	workers := serviceWorkerContext{
-		Context: detached,
-		parent:  ctx,
-		timeout: workerTimeout,
-		done:    make(chan struct{}),
-	}
-	runtimeCancel := sync.OnceFunc(func() {
-		cancelRuntime(context.Cause(ctx))
-		close(workers.done)
-	})
-	stopRuntimeCancel := context.AfterFunc(ctx, func() {
-		if drainTimeout() <= 0 {
-			runtimeCancel()
-		}
-	})
-	defer stopRuntimeCancel()
-	defer runtimeCancel()
-
 	s.cfgMu.Lock()
-	if s.stopping {
-		s.cfgMu.Unlock()
-		return context.Canceled
-	}
-	s.antigravityContext = workers
-	s.cancelStartup = cancelStartup
+	s.antigravityContext = ctx
+	s.cfgMu.Unlock()
 	s.homeMu.Lock()
 	s.runCancel = runCancel
-	s.runtimeCancel = runtimeCancel
-	s.runDrainTimeout = drainTimeout
 	s.homeMu.Unlock()
-	s.cfgMu.Unlock()
-
-	result := make(chan error, 1)
-	go func() {
-		var err error
-		defer func() { result <- err }()
-		err = s.run(startupCtx, workers)
+	defer func() {
+		runCancel()
+		s.homeMu.Lock()
+		if s.runCancel != nil {
+			s.runCancel = nil
+		}
+		s.homeMu.Unlock()
 	}()
-	var errRun error
-	select {
-	case errRun = <-result:
-	case <-ctx.Done():
-		if drainTimeout() <= 0 {
-			runtimeCancel()
-			errRun = <-result
-		} else {
-			errRun = ctx.Err()
-		}
-	}
-	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), serviceShutdownTimeout)
-	defer cancelShutdown()
-	if errShutdown := s.Shutdown(shutdownCtx); errShutdown != nil {
-		if drainTimeout() > 0 {
-			go log.Errorf("service shutdown returned error: %v", errShutdown)
-		} else {
-			log.Errorf("service shutdown returned error: %v", errShutdown)
-		}
-	}
-	return errRun
-}
 
-// serviceWorkerContext defers cancellation while draining. In zero mode its
-// children observe the deadline and cancellation error of the original context.
-type serviceWorkerContext struct {
-	context.Context
-	parent  context.Context
-	timeout func() int
-	done    chan struct{}
-}
+	s.startModelCatalogUpdaters(ctx)
 
-// Done deliberately differs from the embedded context's channel so derived
-// contexts use this wrapper's Err when propagating cancellation.
-func (c serviceWorkerContext) Done() <-chan struct{} { return c.done }
-
-func (c serviceWorkerContext) Deadline() (time.Time, bool) {
-	if c.timeout() <= 0 {
-		return c.parent.Deadline()
-	}
-	return time.Time{}, false
-}
-
-func (c serviceWorkerContext) Err() error {
-	err := c.Context.Err()
-	if err != nil && c.timeout() <= 0 && c.parent.Err() != nil {
-		return c.parent.Err()
-	}
-	return err
-}
-
-func (s *Service) run(ctx, runtimeCtx context.Context) error {
-
-	s.startModelCatalogUpdaters(runtimeCtx)
-
-	usage.StartDefault(runtimeCtx)
+	usage.StartDefault(ctx)
 	cfg := s.currentConfig()
 	homeEnabled := cfg != nil && cfg.Home.Enabled
 	if homeEnabled {
@@ -165,20 +65,30 @@ func (s *Service) run(ctx, runtimeCtx context.Context) error {
 		forceHomeRuntimeConfig(s.cfg)
 		cfg = s.cfg
 		s.cfgMu.Unlock()
-		s.applyKVStoreConfigContext(ctx, cfg)
+		s.applyKVStoreConfig(cfg)
 		redisqueue.SetUsageStatisticsEnabled(true)
 	}
+
+	defer func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer shutdownCancel()
+		timeout := s.ShutdownTimeout()
+		if errShutdown := s.ShutdownWithBudget(shutdownCtx, timeout); errShutdown != nil {
+			if timeout > 0 {
+				go log.Errorf("service shutdown returned error: %v", errShutdown)
+			} else {
+				log.Errorf("service shutdown returned error: %v", errShutdown)
+			}
+		}
+	}()
 
 	if !homeEnabled {
 		if errEnsureAuthDir := s.ensureAuthDir(); errEnsureAuthDir != nil {
 			return errEnsureAuthDir
 		}
-		s.applyKVStoreConfigContext(ctx, cfg)
+		s.applyKVStoreConfig(cfg)
 	}
 
-	if s.startupStopped() {
-		return context.Canceled
-	}
 	s.applyRetryConfig(cfg)
 	s.configureCooldownStateStore(cfg)
 
@@ -198,10 +108,7 @@ func (s *Service) run(ctx, runtimeCtx context.Context) error {
 			auths:           s.coreManager.List(),
 		})
 		interval := 15 * time.Minute
-		if s.startupStopped() {
-			return context.Canceled
-		}
-		s.coreManager.StartAutoRefresh(runtimeCtx, interval)
+		s.coreManager.StartAutoRefresh(ctx, interval)
 		log.Infof("core auth auto-refresh started (interval=%s)", interval)
 	}
 
@@ -225,9 +132,6 @@ func (s *Service) run(ctx, runtimeCtx context.Context) error {
 
 	// legacy clients removed; no caches to refresh
 
-	if s.startupStopped() {
-		return context.Canceled
-	}
 	s.ensureWebsocketGateway()
 	if homeEnabled {
 		s.registerAvailableExecutors(ctx, executorRegistrationOptions{
@@ -239,13 +143,15 @@ func (s *Service) run(ctx, runtimeCtx context.Context) error {
 
 	// handlers no longer depend on legacy clients; pass nil slice initially
 	server := api.NewServer(cfg, s.coreManager, s.accessManager, s.configPath, s.serverOptions...)
-	s.cfgMu.Lock()
-	if s.stopping {
-		s.cfgMu.Unlock()
+	s.admissionMu.Lock()
+	select {
+	case <-s.admissionClosed:
+		s.admissionMu.Unlock()
 		return context.Canceled
+	default:
+		s.server = server
+		s.admissionMu.Unlock()
 	}
-	s.server = server
-	s.cfgMu.Unlock()
 	s.syncPluginRuntimeConfig(ctx)
 	if homeEnabled {
 		s.configRuntimeMu.Lock()
@@ -258,7 +164,7 @@ func (s *Service) run(ctx, runtimeCtx context.Context) error {
 	}
 
 	if homeEnabled {
-		s.startHomeSubscriberWithStartup(runtimeCtx, ctx)
+		s.startHomeSubscriber(ctx)
 	}
 
 	if s.server != nil && s.wsGateway != nil {
@@ -268,10 +174,6 @@ func (s *Service) run(ctx, runtimeCtx context.Context) error {
 				return
 			}
 			if !oldEnabled && newEnabled {
-				if s.shutdownTimeoutSeconds() <= 0 {
-					_ = s.wsGateway.StopLegacy()
-					return
-				}
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
 				if errStop := s.wsGateway.Stop(ctx); errStop != nil {
@@ -289,71 +191,69 @@ func (s *Service) run(ctx, runtimeCtx context.Context) error {
 		s.hooks.OnBeforeStart(s.currentConfig())
 	}
 
-	if s.startupStopped() {
-		return context.Canceled
-	}
-	serverErr := make(chan error, 1)
-	go func() { serverErr <- server.Start() }()
+	s.serverErr = make(chan error, 1)
+	go func() {
+		if errStart := s.server.Start(); errStart != nil {
+			s.serverErr <- errStart
+		} else {
+			s.serverErr <- nil
+		}
+	}()
 
 	time.Sleep(100 * time.Millisecond)
 	if currentCfg := s.currentConfig(); currentCfg != nil {
 		fmt.Printf("API server started successfully on: %s:%d\n", currentCfg.Host, currentCfg.Port)
 	}
 
-	if s.startupStopped() {
-		return context.Canceled
-	}
 	s.configRuntimeMu.Lock()
-	if !s.startupStopped() {
-		currentCfg := s.currentConfig()
-		if s.shutdownTimeoutSeconds() > 0 {
-			s.applyPprofConfigContext(ctx, currentCfg)
-			s.applyDiscoveryConfigContext(ctx, currentCfg)
-		} else {
-			s.applyPprofConfig(currentCfg)
-			s.applyDiscoveryConfig(currentCfg)
-		}
-	}
+	currentCfg := s.currentConfig()
+	s.applyPprofConfig(currentCfg)
+	s.applyDiscoveryConfig(currentCfg)
 	s.configRuntimeMu.Unlock()
-	if s.startupStopped() {
-		return context.Canceled
-	}
 
 	if s.hooks.OnAfterStart != nil {
 		s.hooks.OnAfterStart(s)
 	}
 
-	if s.startupStopped() {
-		return context.Canceled
-	}
 	if !homeEnabled {
-		var watcherWrapper *WatcherWrapper
-		watcherCtx, watcherCancel := context.WithCancel(context.Background())
-		reloadCallback := func(newCfg *config.Config) { s.applyWatcherConfigUpdate(watcherCtx, newCfg) }
+		reloadCallback := func(newCfg *config.Config) {
+			if newCfg != nil && newCfg.ShutdownTimeoutSeconds > 0 {
+				s.applyConfigUpdateWithAuthSynthesis(ctx, newCfg, false)
+			} else {
+				s.applyWatcherConfigUpdate(newCfg)
+			}
+		}
 
 		authDir := ""
 		if currentCfg := s.currentConfig(); currentCfg != nil {
 			authDir = currentCfg.AuthDir
 		}
-		watcherWrapper, errCreate := s.watcherFactory(s.configPath, authDir, reloadCallback)
-		if errCreate != nil {
-			watcherCancel()
-			return fmt.Errorf("cliproxy: failed to create watcher: %w", errCreate)
+		var watcherWrapper *WatcherWrapper
+		if s.ShutdownTimeout() > 0 {
+			var errCreate error
+			watcherWrapper, errCreate = s.createDrainableWatcher(ctx, authDir, reloadCallback)
+			if errCreate != nil {
+				return errCreate
+			}
+		} else {
+			var errCreate error
+			watcherWrapper, errCreate = s.watcherFactory(s.configPath, authDir, reloadCallback)
+			if errCreate != nil {
+				return fmt.Errorf("cliproxy: failed to create watcher: %w", errCreate)
+			}
+			s.setWatcher(watcherWrapper)
 		}
-		s.cfgMu.Lock()
-		if s.stopping {
-			s.cfgMu.Unlock()
-			watcherCancel()
-			return context.Canceled
+		s.ensureAuthUpdateQueue(ctx)
+		if s.authUpdates != nil {
+			watcherWrapper.SetAuthUpdateQueue(s.authUpdates)
 		}
-		s.watcher = watcherWrapper
-		s.watcherCancel = watcherCancel
-		s.cfgMu.Unlock()
-		s.ensureAuthUpdateQueue(runtimeCtx)
-		watcherWrapper.SetAuthUpdateQueue(s.authUpdates)
 		watcherWrapper.SetConfig(s.currentConfig())
 		s.registerPluginAuthParser()
 
+		watcherCtx, watcherCancel := context.WithCancel(context.Background())
+		s.cfgMu.Lock()
+		s.watcherCancel = watcherCancel
+		s.cfgMu.Unlock()
 		if errStart := watcherWrapper.Start(watcherCtx); errStart != nil {
 			return fmt.Errorf("cliproxy: failed to start watcher: %w", errStart)
 		}
@@ -363,179 +263,157 @@ func (s *Service) run(ctx, runtimeCtx context.Context) error {
 		s.configRuntimeMu.Unlock()
 	}
 
-	if s.startupStopped() {
-		return context.Canceled
-	}
 	s.registerModelRefreshCallback()
 	if !homeEnabled {
-		go s.runAntigravityModelRefresh(runtimeCtx)
+		go s.runAntigravityModelRefresh(ctx)
 	}
 
 	select {
 	case <-ctx.Done():
+		if s.ShutdownTimeout() <= 0 {
+			log.Debug("service context cancelled, shutting down...")
+		}
 		return ctx.Err()
-	case errServer := <-serverErr:
+	case errServer := <-s.serverErr:
 		return errServer
 	}
 }
 
-func (s *Service) startupStopped() bool {
-	s.cfgMu.RLock()
-	defer s.cfgMu.RUnlock()
-	return s.stopping
-}
-
-func (s *Service) shutdownTimeoutSeconds() int {
-	s.cfgMu.RLock()
-	server := s.server
-	if server == nil && s.cfg != nil {
-		timeout := s.cfg.ShutdownTimeoutSeconds
-		s.cfgMu.RUnlock()
-		return timeout
+// createDrainableWatcher lets positive-mode Run abandon a blocked factory.
+// The unbuffered result transfers ownership only if startup is still waiting.
+func (s *Service) createDrainableWatcher(ctx context.Context, authDir string, reload func(*config.Config)) (*WatcherWrapper, error) {
+	type result struct {
+		watcher *WatcherWrapper
+		err     error
 	}
-	s.cfgMu.RUnlock()
-	return server.ShutdownTimeoutSeconds()
+	created := make(chan result)
+	go func() {
+		watcher, err := s.watcherFactory(s.configPath, authDir, reload)
+		select {
+		case created <- result{watcher, err}:
+		case <-ctx.Done():
+			_ = watcher.Stop()
+		case <-s.admissionClosed:
+			_ = watcher.Stop()
+		}
+	}()
+
+	select {
+	case <-s.admissionClosed:
+		return nil, context.Canceled
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case result := <-created:
+		if result.err != nil {
+			_ = result.watcher.Stop()
+			return nil, fmt.Errorf("cliproxy: failed to create watcher: %w", result.err)
+		}
+		s.cfgMu.Lock()
+		select {
+		case <-s.admissionClosed:
+			s.cfgMu.Unlock()
+			_ = result.watcher.Stop()
+			return nil, context.Canceled
+		default:
+			s.watcher = result.watcher
+			s.cfgMu.Unlock()
+			return result.watcher, nil
+		}
+	}
 }
 
-// Shutdown stops background workers and shuts down the HTTP server.
-// It ensures all resources are properly cleaned up and connections are closed.
-// The shutdown is idempotent and can be called multiple times safely.
-//
-// Parameters:
-//   - ctx: The context for controlling the shutdown timeout
-//
-// Returns:
-//   - error: An error if shutdown fails
+// ShutdownTimeout returns the current drain budget without waiting for a reload.
+func (s *Service) ShutdownTimeout() time.Duration {
+	if s == nil {
+		return 0
+	}
+	cfg := s.shutdownConfig.Load()
+	if cfg == nil {
+		cfg = s.currentConfig()
+	}
+	if cfg == nil {
+		return 0
+	}
+	return internalconfig.ShutdownDuration(cfg.ShutdownTimeoutSeconds)
+}
+
+// Shutdown stops the service. With a positive drain budget the API stops
+// accepting immediately, and ctx bounds how long the caller waits. Legacy
+// resource teardown may continue in the background after ctx expires.
 func (s *Service) Shutdown(ctx context.Context) error {
+	return s.ShutdownWithBudget(ctx, s.ShutdownTimeout())
+}
+
+// ShutdownWithBudget uses a snapshot of ShutdownTimeout. The standalone
+// command uses the same snapshot for its process exit timer and HTTP drain.
+func (s *Service) ShutdownWithBudget(ctx context.Context, budget time.Duration) error {
 	if s == nil {
 		return nil
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	s.homeMu.Lock()
-	drainTimeoutForRun := s.runDrainTimeout
-	s.homeMu.Unlock()
-	drainTimeout := s.shutdownTimeoutSeconds()
-	if drainTimeoutForRun != nil {
-		drainTimeout = drainTimeoutForRun()
+	state := s.shutdownState.Load()
+	if state == nil {
+		state = &serviceShutdown{budget: budget, ctx: ctx}
+		if !s.shutdownState.CompareAndSwap(nil, state) {
+			state = s.shutdownState.Load()
+		}
 	}
-	if drainTimeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, serviceShutdownTimeout)
-		defer cancel()
+	if state.budget <= 0 {
+		var err error
+		state.once.Do(func() { err = s.shutdownResources(state.ctx, true) })
+		return err
 	}
-	first := false
-	s.shutdownOnce.Do(func() {
-		first = true
-		s.shutdownDone = make(chan struct{})
+
+	state.once.Do(func() {
+		s.admissionMu.Lock()
+		server := s.server
+		if server != nil {
+			server.StopAccepting()
+		}
+		if s.admissionClosed != nil {
+			close(s.admissionClosed)
+		}
+		s.admissionMu.Unlock()
+
+		state.done = make(chan struct{})
+		drainCtx, cancel := context.WithTimeout(state.ctx, state.budget)
+		go func() {
+			defer close(state.done)
+			defer cancel()
+			profileDone := make(chan error, 1)
+			go func() { profileDone <- s.stopPprofForDrain(drainCtx) }()
+			var errDrain error
+			if server != nil {
+				errDrain = server.Drain(drainCtx)
+			}
+			// Leave the relay and request dependencies alive until HTTP has drained.
+			state.err = errors.Join(errDrain, <-profileDone, s.shutdownResources(drainCtx, false))
+		}()
 	})
-	if !first {
-		if drainTimeout <= 0 {
-			<-s.shutdownDone
-			return nil
-		}
-		return shutdown.Wait(ctx, s.shutdownDone)
-	}
-	defer close(s.shutdownDone)
-	if drainTimeout <= 0 {
-		return s.shutdownLegacy(ctx)
-	}
 
-	s.cfgMu.Lock()
-	s.stopping = true
-	server := s.server
-	watcherCancel := s.watcherCancel
-	cancelStartup := s.cancelStartup
-	gateway := s.wsGateway
-	authQueueStop := s.authQueueStop
-	s.cfgMu.Unlock()
-	if cancelStartup != nil {
-		cancelStartup()
+	select {
+	case <-state.done:
+		return state.err
+	default:
 	}
-
-	s.homeMu.Lock()
-	runCancel := s.runCancel
-	runtimeCancel := s.runtimeCancel
-	s.homeMu.Unlock()
-
-	var shutdownErr error
-	recordError := func(component string, err error) {
-		if err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(err, ctxErr) {
-				go log.WithError(err).Debugf("stopped waiting for %s", component)
-			} else {
-				go log.WithError(err).Errorf("failed to stop %s", component)
-			}
-			if shutdownErr == nil {
-				shutdownErr = err
-			}
-		}
+	select {
+	case <-state.done:
+		return state.err
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	if server != nil {
-		recordError("API server", server.StopWithDrainTimeout(ctx, drainTimeout))
-	}
-	if runCancel != nil {
-		runCancel()
-	}
-	if runtimeCancel != nil {
-		runtimeCancel()
-	}
-	if watcherCancel != nil {
-		watcherCancel()
-	}
-	if gateway != nil {
-		recordError("websocket gateway", gateway.Shutdown(ctx))
-	}
-	recordError("pprof server", s.shutdownPprof(ctx))
-
-	recordError("Home workers", shutdown.Run(ctx, func() error {
-		s.homeLifecycleMu.Lock()
-		defer s.homeLifecycleMu.Unlock()
-		s.shutdownHome(ctx)
-		return nil
-	}))
-
-	if s.coreManager != nil {
-		recordError("auth refresh and selector", shutdown.Run(ctx, func() error {
-			s.coreManager.StopAutoRefresh()
-			return nil
-		}))
-	}
-	if watcher := s.currentWatcher(); watcher != nil {
-		recordError("file watcher", shutdown.Run(ctx, watcher.Stop))
-	}
-	if authQueueStop != nil {
-		authQueueStop()
-	}
-	recordError("discovery advertiser", s.shutdownDiscovery(ctx))
-
-	if s.pluginHost != nil {
-		s.pluginHost.RetireSharedRuntime()
-		recordError("plugins", shutdown.Run(ctx, func() error {
-			s.shutdownPlugins(ctx)
-			return nil
-		}))
-	}
-	if s.kvStoreManaged.Swap(false) {
-		recordError("local kv store", s.shutdownKVStore(ctx))
-	}
-	recordError("proxy pool", helps.RetireProxyPoolPublisherContext(ctx, s.proxyPoolPublisher))
-	usage.StopDefault()
-	return shutdownErr
 }
 
-func (s *Service) shutdownLegacy(ctx context.Context) error {
+func (s *Service) shutdownResources(ctx context.Context, stopAPI bool) error {
 	var shutdownErr error
+
 	s.homeMu.Lock()
 	runCancel := s.runCancel
-	runtimeCancel := s.runtimeCancel
 	s.homeMu.Unlock()
 	if runCancel != nil {
 		runCancel()
-	}
-	if runtimeCancel != nil {
-		runtimeCancel()
 	}
 
 	s.homeLifecycleMu.Lock()
@@ -580,7 +458,7 @@ func (s *Service) shutdownLegacy(ctx context.Context) error {
 		if homeForwarderClient == homeClient {
 			homeForwarder.Deactivate(homeClient)
 		}
-		homeForwarder.StopContext(context.Background())
+		homeForwarder.Stop()
 	}
 	s.homeLifecycleMu.Unlock()
 
@@ -602,7 +480,7 @@ func (s *Service) shutdownLegacy(ctx context.Context) error {
 		}
 	}
 	if s.wsGateway != nil {
-		if err := s.wsGateway.StopLegacy(); err != nil {
+		if err := s.wsGateway.Stop(ctx); err != nil {
 			log.Errorf("failed to stop websocket gateway: %v", err)
 			if shutdownErr == nil {
 				shutdownErr = err
@@ -614,14 +492,16 @@ func (s *Service) shutdownLegacy(ctx context.Context) error {
 		s.authQueueStop = nil
 	}
 
-	if errShutdownPprof := s.shutdownPprofLegacy(ctx); errShutdownPprof != nil {
-		log.Errorf("failed to stop pprof server: %v", errShutdownPprof)
-		if shutdownErr == nil {
-			shutdownErr = errShutdownPprof
+	if stopAPI {
+		if errShutdownPprof := s.shutdownPprof(ctx); errShutdownPprof != nil {
+			log.Errorf("failed to stop pprof server: %v", errShutdownPprof)
+			if shutdownErr == nil {
+				shutdownErr = errShutdownPprof
+			}
 		}
 	}
 
-	if errShutdownDiscovery := s.shutdownDiscovery(context.Background()); errShutdownDiscovery != nil {
+	if errShutdownDiscovery := s.shutdownDiscovery(); errShutdownDiscovery != nil {
 		log.Errorf("failed to stop discovery advertiser: %v", errShutdownDiscovery)
 		if shutdownErr == nil {
 			shutdownErr = errShutdownDiscovery
@@ -630,7 +510,7 @@ func (s *Service) shutdownLegacy(ctx context.Context) error {
 
 	// no legacy clients to persist
 
-	if s.server != nil {
+	if stopAPI && s.server != nil {
 		if errStop := s.server.StopWithDrainTimeout(ctx, 0); errStop != nil {
 			log.Errorf("error stopping API server: %v", errStop)
 			if shutdownErr == nil {
@@ -657,95 +537,16 @@ func (s *Service) shutdownLegacy(ctx context.Context) error {
 		}
 	}
 
-	s.kvStoreManaged.Store(false)
-	if errShutdownKV := kvstore.ShutdownLocal(); errShutdownKV != nil {
+	if errShutdownKV := s.shutdownKVStore(); errShutdownKV != nil {
 		log.Errorf("failed to stop local kv store: %v", errShutdownKV)
 		if shutdownErr == nil {
 			shutdownErr = errShutdownKV
 		}
 	}
 
-	helps.RetireProxyPoolPublisherLegacy(s.proxyPoolPublisher)
+	helps.RetireProxyPoolPublisher(s.proxyPoolPublisher)
 	usage.StopDefault()
 	return shutdownErr
-}
-
-func (s *Service) shutdownHome(ctx context.Context) {
-	homeSupervisorPending := false
-	if supervisor := s.homeSupervisor; supervisor != nil {
-		supervisor.cancel()
-		select {
-		case <-supervisor.done:
-		case <-ctx.Done():
-			if supervisor.cancelDrain != nil {
-				supervisor.cancelDrain()
-			}
-			homeSupervisorPending = true
-		}
-	}
-	s.homeMu.Lock()
-	homeCancel := s.homeCancel
-	homeClient := s.homeClient
-	homeRegistry := s.homeRegistry
-	homeDispatchBundle := s.homeDispatchBundle
-	homeForwarder := s.homeLogForwarder
-	homeForwarderClient := s.homeLogForwarderClient
-	s.homeGeneration++
-	s.homeCancel = nil
-	s.homeClient = nil
-	s.homeRegistry = nil
-	s.homeDispatchBundle = nil
-	s.homeDrainBound = 0
-	s.homeLogForwarder = nil
-	s.homeLogForwarderClient = nil
-	s.homeMu.Unlock()
-	if s.coreManager != nil {
-		s.coreManager.ClearHomeDispatchBundle(homeDispatchBundle)
-	}
-	home.ClearCurrentIf(homeClient)
-	if homeCancel != nil {
-		homeCancel()
-	}
-	// A supervisor still exiting owns the registry drain and client close.
-	if homeClient != nil {
-		if homeSupervisorPending {
-			homeClient.FenceDispatch()
-		} else {
-			_ = shutdown.Run(ctx, func() error {
-				homeClient.Close()
-				return nil
-			})
-		}
-	}
-	if homeForwarder != nil {
-		if homeForwarderClient == homeClient {
-			homeForwarder.Deactivate(homeClient)
-		}
-		homeForwarder.StopContext(ctx)
-	}
-	if homeRegistry != nil && !homeSupervisorPending {
-		if errClose := shutdown.Run(ctx, homeRegistry.Close); errClose != nil {
-			go log.WithError(errClose).Warn("failed to close Home execution registry during shutdown")
-		}
-	}
-}
-
-func (s *Service) shutdownPlugins(ctx context.Context) {
-	sdktranslator.ClearPluginHooks(s.pluginHost)
-	sdkAuth.ClearPluginAuthParser(s.pluginHost)
-	if watcher := s.currentWatcher(); watcher != nil {
-		watcher.SetPluginAuthParser(nil)
-	}
-	s.pluginHost.ApplyConfig(ctx, &config.Config{})
-	s.pluginHost.RegisterModels(ctx, registry.GetGlobalRegistry())
-	s.registerAvailableExecutors(ctx, executorRegistrationOptions{
-		includePlugins: true,
-	})
-	s.pluginHost.RegisterFrontendAuthProviders()
-	s.pluginHost.ShutdownAllContext(ctx)
-	if s.accessManager != nil {
-		s.accessManager.SetProviders(sdkaccess.RegisteredProviders())
-	}
 }
 
 func (s *Service) ensureAuthDir() error {

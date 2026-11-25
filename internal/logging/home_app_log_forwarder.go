@@ -32,9 +32,9 @@ type homeAppLogPayload struct {
 type HomeAppLogForwarder struct {
 	formatter log.Formatter
 	queue     chan homeAppLogPayload
-	cancel    context.CancelFunc
-	done      chan struct{}
+	stop      chan struct{}
 	stopOnce  sync.Once
+	wg        sync.WaitGroup
 	enabled   atomic.Bool
 	stopped   atomic.Bool
 	ownerMu   sync.Mutex
@@ -103,26 +103,20 @@ func StartHomeAppLogForwarder(queueSize int) *HomeAppLogForwarder {
 	if queueSize <= 0 {
 		queueSize = defaultHomeAppLogQueueSize
 	}
-	ctx, cancel := context.WithCancel(context.Background())
 	forwarder := &HomeAppLogForwarder{
 		formatter: &LogFormatter{},
 		queue:     make(chan homeAppLogPayload, queueSize),
-		cancel:    cancel,
-		done:      make(chan struct{}),
+		stop:      make(chan struct{}),
 	}
 	forwarder.enabled.Store(true)
-	go forwarder.run(ctx)
+	forwarder.wg.Add(1)
+	go forwarder.run()
 	registerHomeAppLogForwarder(forwarder)
 	return forwarder
 }
 
 // Stop disables forwarding and waits for the background sender to exit.
 func (f *HomeAppLogForwarder) Stop() {
-	f.StopContext(context.Background())
-}
-
-// StopContext cancels the sender and waits at most until ctx expires.
-func (f *HomeAppLogForwarder) StopContext(ctx context.Context) {
 	if f == nil {
 		return
 	}
@@ -133,12 +127,9 @@ func (f *HomeAppLogForwarder) StopContext(ctx context.Context) {
 		f.ownerMu.Unlock()
 		f.enabled.Store(false)
 		homeAppLogMuxHook.unregister(f)
-		f.cancel()
+		close(f.stop)
+		f.wg.Wait()
 	})
-	select {
-	case <-f.done:
-	case <-ctx.Done():
-	}
 }
 
 // Bind activates forwarding to client.
@@ -238,19 +229,19 @@ func (f *HomeAppLogForwarder) formatEntry(entry *log.Entry) (string, error) {
 	return string(raw), nil
 }
 
-func (f *HomeAppLogForwarder) run(ctx context.Context) {
-	defer close(f.done)
+func (f *HomeAppLogForwarder) run() {
+	defer f.wg.Done()
 	for {
 		select {
-		case <-ctx.Done():
+		case <-f.stop:
 			return
 		case payload := <-f.queue:
-			f.forward(ctx, payload)
+			f.forward(payload)
 		}
 	}
 }
 
-func (f *HomeAppLogForwarder) forward(ctx context.Context, payload homeAppLogPayload) {
+func (f *HomeAppLogForwarder) forward(payload homeAppLogPayload) {
 	client := payload.client
 	if client == nil {
 		client = f.client()
@@ -265,7 +256,7 @@ func (f *HomeAppLogForwarder) forward(ctx context.Context, payload homeAppLogPay
 	if errMarshal != nil {
 		return
 	}
-	if errPush := client.RPushAppLog(ctx, raw); errPush != nil && isHomeAppLogUnsupported(errPush) {
+	if errPush := client.RPushAppLog(context.Background(), raw); errPush != nil && isHomeAppLogUnsupported(errPush) {
 		f.disableIfCurrentOwner(client)
 	}
 }

@@ -81,7 +81,7 @@ func TestPutOpenAICompatConcurrentWithAuthFieldsPatch_Issue6559(t *testing.T) {
 	t.Cleanup(cancel)
 
 	watcherWrapper, errWatcher := service.watcherFactory(configPath, authDir, func(newCfg *config.Config) {
-		service.applyWatcherConfigUpdate(t.Context(), newCfg)
+		service.applyWatcherConfigUpdate(newCfg)
 	})
 	if errWatcher != nil {
 		t.Fatalf("watcherFactory failed: %v", errWatcher)

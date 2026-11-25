@@ -301,11 +301,9 @@ func TestDiscoveryManagerRejectsApplyAfterShutdown(t *testing.T) {
 }
 
 func TestDiscoveryRefreshStopIsIdempotent(t *testing.T) {
-	ctx, cancel := context.WithCancel(t.Context())
 	refresh := &discoveryRefresh{
-		ctx:    ctx,
-		cancel: cancel,
-		done:   make(chan struct{}),
+		stop: make(chan struct{}),
+		done: make(chan struct{}),
 	}
 	close(refresh.done)
 	refresh.stopAndWait()

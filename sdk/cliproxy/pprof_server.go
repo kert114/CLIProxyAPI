@@ -3,7 +3,6 @@ package cliproxy
 import (
 	"context"
 	"errors"
-	"net"
 	"net/http"
 	"net/http/pprof"
 	"strings"
@@ -15,13 +14,12 @@ import (
 )
 
 type pprofServer struct {
-	mu       sync.Mutex
-	server   *http.Server
-	listener net.Listener
-	addr     string
-	enabled  bool
-	owner    uint64
-	stopped  bool
+	mu      sync.Mutex
+	server  *http.Server
+	addr    string
+	enabled bool
+	owner   uint64
+	stopped bool
 }
 
 func newPprofServer() *pprofServer {
@@ -39,35 +37,17 @@ func (s *Service) applyPprofConfigContext(ctx context.Context, cfg *config.Confi
 	if s.applyPprofConfigContextFn != nil {
 		return s.applyPprofConfigContextFn(ctx, cfg)
 	}
-	s.cfgMu.Lock()
-	if s.stopping {
-		s.cfgMu.Unlock()
-		return false
-	}
 	if s.pprofServer == nil {
 		s.pprofServer = newPprofServer()
 	}
-	profiler := s.pprofServer
-	s.cfgMu.Unlock()
-	return profiler.ApplyContext(ctx, cfg)
+	return s.pprofServer.ApplyContext(ctx, cfg)
 }
 
 func (s *Service) shutdownPprof(ctx context.Context) error {
-	return s.stopPprof(ctx, true)
-}
-
-func (s *Service) shutdownPprofLegacy(ctx context.Context) error {
-	return s.stopPprof(ctx, false)
-}
-
-func (s *Service) stopPprof(ctx context.Context, bounded bool) error {
-	if s == nil {
+	if s == nil || s.pprofServer == nil {
 		return nil
 	}
-	s.cfgMu.RLock()
-	profiler := s.pprofServer
-	s.cfgMu.RUnlock()
-	return profiler.shutdown(ctx, bounded)
+	return s.pprofServer.Shutdown(ctx)
 }
 
 func (p *pprofServer) Apply(cfg *config.Config) {
@@ -91,22 +71,19 @@ func (p *pprofServer) ApplyContext(ctx context.Context, cfg *config.Config) bool
 	enabled := cfg.Pprof.Enable
 
 	p.mu.Lock()
-	if p.stopped || ctx.Err() != nil {
+	if p.stopped {
 		p.mu.Unlock()
 		return false
 	}
 	p.owner++
 	owner := p.owner
-	currentServer, currentListener := p.server, p.listener
+	currentServer := p.server
 	currentAddr := p.addr
 	p.addr = addr
 	p.enabled = enabled
 	if !enabled {
-		p.server, p.listener = nil, nil
+		p.server = nil
 		p.mu.Unlock()
-		if currentListener != nil {
-			_ = currentListener.Close()
-		}
 		if currentServer != nil {
 			if errStop := p.stopServerWithContext(ctx, currentServer, currentAddr, "disabled"); errStop != nil {
 				return false
@@ -118,12 +95,9 @@ func (p *pprofServer) ApplyContext(ctx context.Context, cfg *config.Config) bool
 		p.mu.Unlock()
 		return ctx.Err() == nil
 	}
-	p.server, p.listener = nil, nil
+	p.server = nil
 	p.mu.Unlock()
 
-	if currentListener != nil {
-		_ = currentListener.Close()
-	}
 	if currentServer != nil {
 		if errStop := p.stopServerWithContext(ctx, currentServer, currentAddr, "restarted"); errStop != nil {
 			return false
@@ -145,60 +119,54 @@ func (p *pprofServer) ApplyContext(ctx context.Context, cfg *config.Config) bool
 	return true
 }
 
-func (p *pprofServer) Shutdown(ctx context.Context) error {
-	return p.shutdown(ctx, true)
+// stopPprofForDrain prevents a concurrent reload from reopening pprof.
+func (s *Service) stopPprofForDrain(ctx context.Context) error {
+	if p := s.pprofServer; p != nil {
+		p.mu.Lock()
+		p.stopped = true
+		p.mu.Unlock()
+		return p.Shutdown(ctx)
+	}
+	return nil
 }
 
-func (p *pprofServer) shutdown(ctx context.Context, bounded bool) error {
+func (p *pprofServer) Shutdown(ctx context.Context) error {
 	if p == nil {
 		return nil
 	}
 	p.mu.Lock()
-	currentServer, currentListener := p.server, p.listener
+	currentServer := p.server
 	currentAddr := p.addr
 	p.owner++
-	p.server, p.listener = nil, nil
+	p.server = nil
 	p.enabled = false
-	p.stopped = bounded
 	p.mu.Unlock()
 
-	if currentListener != nil {
-		_ = currentListener.Close()
-	}
 	if currentServer == nil {
 		return nil
 	}
-	return p.stopServerMode(ctx, currentServer, currentAddr, "shutdown", bounded)
+	return p.stopServerWithContext(ctx, currentServer, currentAddr, "shutdown")
 }
 
 func (p *pprofServer) startServer(addr string, owner uint64) *http.Server {
+	mux := newPprofMux()
 	server := &http.Server{
 		Addr:              addr,
-		Handler:           newPprofMux(),
+		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
-	tcpAddr, errResolve := net.ResolveTCPAddr("tcp", addr)
-	if errResolve != nil {
-		log.Errorf("pprof server failed on %s: %v", addr, errResolve)
-		return nil
-	}
+
 	p.mu.Lock()
-	if !p.enabled || p.addr != addr || p.owner != owner || p.server != nil {
+	if p.stopped || !p.enabled || p.addr != addr || p.owner != owner || p.server != nil {
 		p.mu.Unlock()
 		return nil
 	}
-	listener, errListen := net.ListenTCP("tcp", tcpAddr)
-	if errListen != nil {
-		p.mu.Unlock()
-		log.Errorf("pprof server failed on %s: %v", addr, errListen)
-		return nil
-	}
-	p.server, p.listener = server, listener
+	p.server = server
 	p.mu.Unlock()
 
+	log.Infof("pprof server starting on %s", addr)
 	go func() {
-		log.Infof("pprof server starting on %s", addr)
-		if errServe := server.Serve(listener); errServe != nil && !errors.Is(errServe, http.ErrServerClosed) && !errors.Is(errServe, net.ErrClosed) {
+		if errServe := server.ListenAndServe(); errServe != nil && !errors.Is(errServe, http.ErrServerClosed) {
 			log.Errorf("pprof server failed on %s: %v", addr, errServe)
 			p.clearFailedServer(server)
 		}
@@ -214,7 +182,7 @@ func (p *pprofServer) clearFailedServer(server *http.Server) {
 	}
 	p.mu.Lock()
 	if p.server == server {
-		p.server, p.listener = nil, nil
+		p.server = nil
 	}
 	p.mu.Unlock()
 }
@@ -232,20 +200,12 @@ func (p *pprofServer) stopOwnedServerWithContext(ctx context.Context, server *ht
 		p.mu.Unlock()
 		return nil
 	}
-	listener := p.listener
-	p.server, p.listener = nil, nil
+	p.server = nil
 	p.mu.Unlock()
-	if listener != nil {
-		_ = listener.Close()
-	}
 	return p.stopServerWithContext(ctx, server, addr, reason)
 }
 
 func (p *pprofServer) stopServerWithContext(ctx context.Context, server *http.Server, addr string, reason string) error {
-	return p.stopServerMode(ctx, server, addr, reason, true)
-}
-
-func (p *pprofServer) stopServerMode(ctx context.Context, server *http.Server, addr string, reason string, bounded bool) error {
 	if server == nil {
 		return nil
 	}
@@ -255,22 +215,11 @@ func (p *pprofServer) stopServerMode(ctx context.Context, server *http.Server, a
 	}
 	stopCtx, cancel := context.WithTimeout(stopCtx, 5*time.Second)
 	defer cancel()
-	if errStop := server.Shutdown(stopCtx); errStop != nil && !errors.Is(errStop, net.ErrClosed) {
-		if bounded {
-			if errClose := server.Close(); errClose != nil && !errors.Is(errClose, http.ErrServerClosed) {
-				errStop = errors.Join(errStop, errClose)
-			}
-			go log.Errorf("pprof server stop failed on %s: %v", addr, errStop)
-		} else {
-			log.Errorf("pprof server stop failed on %s: %v", addr, errStop)
-		}
+	if errStop := server.Shutdown(stopCtx); errStop != nil {
+		log.Errorf("pprof server stop failed on %s: %v", addr, errStop)
 		return errStop
 	}
-	if bounded {
-		go log.Infof("pprof server stopped on %s (%s)", addr, reason)
-	} else {
-		log.Infof("pprof server stopped on %s (%s)", addr, reason)
-	}
+	log.Infof("pprof server stopped on %s (%s)", addr, reason)
 	return nil
 }
 

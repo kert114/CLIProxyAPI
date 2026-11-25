@@ -37,18 +37,14 @@ func (s *Service) ensureAuthUpdateQueue(ctx context.Context) {
 	if s == nil {
 		return
 	}
-	queueCtx, cancel := context.WithCancel(ctx)
-	s.cfgMu.Lock()
-	if s.stopping || s.authQueueStop != nil {
-		s.cfgMu.Unlock()
-		cancel()
-		return
-	}
 	if s.authUpdates == nil {
 		s.authUpdates = make(chan watcher.AuthUpdate, 256)
 	}
+	if s.authQueueStop != nil {
+		return
+	}
+	queueCtx, cancel := context.WithCancel(ctx)
 	s.authQueueStop = cancel
-	s.cfgMu.Unlock()
 	go s.consumeAuthUpdates(queueCtx)
 }
 
@@ -87,12 +83,9 @@ func (s *Service) emitAuthUpdate(ctx context.Context, update watcher.AuthUpdate)
 	if watcher := s.currentWatcher(); watcher != nil && watcher.DispatchRuntimeAuthUpdate(update) {
 		return
 	}
-	s.cfgMu.RLock()
-	updates := s.authUpdates
-	s.cfgMu.RUnlock()
-	if updates != nil {
+	if s.authUpdates != nil {
 		select {
-		case updates <- update:
+		case s.authUpdates <- update:
 			return
 		default:
 			log.Debugf("auth update queue saturated, applying inline action=%v id=%s", update.Action, update.ID)
@@ -344,29 +337,21 @@ func (s *Service) ensureWebsocketGateway() {
 	if s == nil {
 		return
 	}
-	s.cfgMu.Lock()
-	defer s.cfgMu.Unlock()
-	if s.wsGateway != nil || s.stopping {
+	if s.wsGateway != nil {
 		return
 	}
 	opts := wsrelay.Options{
-		Path:               "/v1/ws",
-		OnSessionConnected: s.wsOnSessionConnected,
-		OnInvalidated:      s.wsInvalidateAuth,
-		ShouldInvalidate:   func() bool { return s.startupStopped() || s.shutdownTimeoutSeconds() > 0 },
-		OnDisconnected:     s.wsOnDisconnected,
-		LogDebugf:          log.Debugf,
-		LogInfof:           log.Infof,
-		LogWarnf:           log.Warnf,
+		Path:           "/v1/ws",
+		OnConnected:    s.wsOnConnected,
+		OnDisconnected: s.wsOnDisconnected,
+		LogDebugf:      log.Debugf,
+		LogInfof:       log.Infof,
+		LogWarnf:       log.Warnf,
 	}
 	s.wsGateway = wsrelay.NewManager(opts)
 }
 
 func (s *Service) wsOnConnected(channelID string) {
-	s.wsOnSessionConnected(channelID, nil)
-}
-
-func (s *Service) wsOnSessionConnected(channelID string, done <-chan struct{}) {
 	if s == nil || channelID == "" {
 		return
 	}
@@ -382,15 +367,14 @@ func (s *Service) wsOnSessionConnected(channelID string, done <-chan struct{}) {
 	}
 	now := time.Now().UTC()
 	auth := &coreauth.Auth{
-		ID:              channelID,  // keep channel identifier as ID
-		Provider:        "aistudio", // logical provider for switch routing
-		Label:           channelID,  // display original channel id
-		Status:          coreauth.StatusActive,
-		RuntimeLifetime: done,
-		CreatedAt:       now,
-		UpdatedAt:       now,
-		Attributes:      map[string]string{"runtime_only": "true"},
-		Metadata:        map[string]any{"email": channelID}, // metadata drives logging and usage tracking
+		ID:         channelID,  // keep channel identifier as ID
+		Provider:   "aistudio", // logical provider for switch routing
+		Label:      channelID,  // display original channel id
+		Status:     coreauth.StatusActive,
+		CreatedAt:  now,
+		UpdatedAt:  now,
+		Attributes: map[string]string{"runtime_only": "true"},
+		Metadata:   map[string]any{"email": channelID}, // metadata drives logging and usage tracking
 	}
 	log.Infof("websocket provider connected: %s", channelID)
 	s.emitAuthUpdate(context.Background(), watcher.AuthUpdate{
@@ -400,19 +384,8 @@ func (s *Service) wsOnSessionConnected(channelID string, done <-chan struct{}) {
 	})
 }
 
-func (s *Service) wsInvalidateAuth(channelID string, lifetime <-chan struct{}) {
-	if s.coreManager == nil {
-		return
-	}
-	if s.coreManager.RemoveIf(context.Background(), channelID, func(auth *coreauth.Auth) bool {
-		return auth != nil && auth.RuntimeLifetime == lifetime
-	}) {
-		GlobalModelRegistry().UnregisterClient(channelID)
-	}
-}
-
-func (s *Service) wsOnDisconnected(ctx context.Context, channelID string, reason error) {
-	if s == nil || channelID == "" || ctx.Err() != nil {
+func (s *Service) wsOnDisconnected(channelID string, reason error) {
+	if s == nil || channelID == "" {
 		return
 	}
 	if reason != nil {
@@ -424,6 +397,7 @@ func (s *Service) wsOnDisconnected(ctx context.Context, channelID string, reason
 	} else {
 		log.Infof("websocket provider disconnected: %s", channelID)
 	}
+	ctx := context.Background()
 	s.emitAuthUpdate(ctx, watcher.AuthUpdate{
 		Action: watcher.AuthUpdateActionDelete,
 		ID:     channelID,

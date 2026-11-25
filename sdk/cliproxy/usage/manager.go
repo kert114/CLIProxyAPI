@@ -657,15 +657,8 @@ func (m *Manager) Start(ctx context.Context) {
 		if ctx == nil {
 			ctx = context.Background()
 		}
-		workerCtx, cancel := context.WithCancel(ctx)
-		m.mu.Lock()
-		if m.closed {
-			m.mu.Unlock()
-			cancel()
-			return
-		}
-		m.cancel = cancel
-		m.mu.Unlock()
+		var workerCtx context.Context
+		workerCtx, m.cancel = context.WithCancel(ctx)
 		go m.run(workerCtx)
 	})
 }
@@ -676,13 +669,12 @@ func (m *Manager) Stop() {
 		return
 	}
 	m.stopOnce.Do(func() {
+		if m.cancel != nil {
+			m.cancel()
+		}
 		m.mu.Lock()
-		cancel := m.cancel
 		m.closed = true
 		m.mu.Unlock()
-		if cancel != nil {
-			cancel()
-		}
 		m.cond.Broadcast()
 	})
 }

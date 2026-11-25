@@ -14,7 +14,6 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/shutdown"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/watcher/diff"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
@@ -24,9 +23,8 @@ import (
 )
 
 type homeSubscriberSupervisor struct {
-	cancel      context.CancelFunc
-	cancelDrain context.CancelFunc
-	done        chan struct{}
+	cancel context.CancelFunc
+	done   chan struct{}
 
 	publisherMu   sync.Mutex
 	publisherDone <-chan struct{}
@@ -124,7 +122,7 @@ func (q *homeConfigWorkQueue) tryDequeueLatest() ([]byte, bool) {
 type homeLogForwarder interface {
 	Bind(*home.Client)
 	Deactivate(*home.Client)
-	StopContext(context.Context)
+	Stop()
 }
 
 var startHomeLogForwarder = func(queueSize int) homeLogForwarder {
@@ -389,10 +387,6 @@ func applyHomeInFlightPublisherConfig(manager *coreauth.Manager, cfg internalcon
 }
 
 func (s *Service) startHomeSubscriber(ctx context.Context) {
-	s.startHomeSubscriberWithStartup(ctx, nil)
-}
-
-func (s *Service) startHomeSubscriberWithStartup(ctx, startupCtx context.Context) {
 	if s == nil {
 		return
 	}
@@ -415,32 +409,25 @@ func (s *Service) startHomeSubscriberWithStartup(ctx, startupCtx context.Context
 		s.homeConfigCommitMu.Lock()
 		previousSupervisor.cancel()
 		s.homeConfigCommitMu.Unlock()
-		if shutdown.Wait(parentCtx, previousSupervisor.done) != nil {
-			if previousSupervisor.cancelDrain != nil {
-				previousSupervisor.cancelDrain()
-			}
-			return
-		}
+		<-previousSupervisor.done
 	}
 	if !s.drainDetachedHomeLifetime(parentCtx) {
 		return
 	}
-	if parentCtx.Err() != nil || (startupCtx != nil && s.startupStopped()) {
+	if parentCtx.Err() != nil {
 		return
 	}
 
 	homeCtx, cancel := context.WithCancel(parentCtx)
-	// Draining can outlive the subscription but must stop at the service deadline.
-	drainCtx, cancelDrain := context.WithCancel(context.WithoutCancel(parentCtx))
 	done := make(chan struct{})
 	s.homeMu.Lock()
 	s.homeGeneration++
 	generation := s.homeGeneration
 	s.homeCancel = cancel
 	s.homeMu.Unlock()
-	supervisor := &homeSubscriberSupervisor{cancel: cancel, cancelDrain: cancelDrain, done: done}
+	supervisor := &homeSubscriberSupervisor{cancel: cancel, done: done}
 	s.homeSupervisor = supervisor
-	go s.runHomeSubscriber(homeCtx, parentCtx, drainCtx, cfg.Home, generation, supervisor)
+	go s.runHomeSubscriber(homeCtx, parentCtx, cfg.Home, generation, supervisor)
 }
 
 func (s *Service) drainDetachedHomeLifetime(parentCtx context.Context) bool {
@@ -474,7 +461,7 @@ func (s *Service) drainDetachedHomeLifetime(parentCtx context.Context) bool {
 		if previousDrainBound <= 0 {
 			previousDrainBound = internalconfig.CredentialConcurrencyConfig{}.WithDefaults().CPACancelBound
 		}
-		drainCtx, cancelDrain := context.WithTimeout(parentCtx, previousDrainBound)
+		drainCtx, cancelDrain := context.WithTimeout(context.WithoutCancel(parentCtx), previousDrainBound)
 		errDrain := previousRegistry.Drain(drainCtx)
 		cancelDrain()
 		if errDrain != nil {
@@ -494,7 +481,7 @@ func (s *Service) drainDetachedHomeLifetime(parentCtx context.Context) bool {
 	return true
 }
 
-func (s *Service) runHomeSubscriber(homeCtx, parentCtx, drainParent context.Context, homeCfg internalconfig.HomeConfig, generation uint64, supervisor *homeSubscriberSupervisor) {
+func (s *Service) runHomeSubscriber(homeCtx context.Context, parentCtx context.Context, homeCfg internalconfig.HomeConfig, generation uint64, supervisor *homeSubscriberSupervisor) {
 	defer func() {
 		s.homeMu.Lock()
 		if s.homeGeneration == generation {
@@ -503,7 +490,6 @@ func (s *Service) runHomeSubscriber(homeCtx, parentCtx, drainParent context.Cont
 		s.homeMu.Unlock()
 		close(supervisor.done)
 	}()
-	defer supervisor.cancelDrain()
 
 	var previousClient *home.Client
 	var retryBackoff homeSubscriberRetryBackoff
@@ -518,7 +504,7 @@ func (s *Service) runHomeSubscriber(homeCtx, parentCtx, drainParent context.Cont
 		if drainBound <= 0 {
 			drainBound = internalconfig.CredentialConcurrencyConfig{}.WithDefaults().CPACancelBound
 		}
-		drainCtx, cancelDrain := context.WithTimeout(drainParent, drainBound)
+		drainCtx, cancelDrain := context.WithTimeout(context.WithoutCancel(parentCtx), drainBound)
 		errDrain := registry.Drain(drainCtx)
 		cancelDrain()
 		if errDrain != nil && !errors.Is(errDrain, executionregistry.ErrRegistryClosed) && parentCtx.Err() == nil {
@@ -536,11 +522,7 @@ func (s *Service) runHomeSubscriber(homeCtx, parentCtx, drainParent context.Cont
 			client = client.NewLifetime()
 		}
 		client.SetManagedLifetime(true)
-		// The active lifetime can be detached before its drain completes.
-		// Keep ownership of its sockets here so service expiry still interrupts I/O.
-		closeClient := sync.OnceFunc(client.Close)
-		stopDeadlineClose := context.AfterFunc(drainParent, closeClient)
-		releaseCtx, releaseCancel := context.WithCancel(drainParent)
+		releaseCtx, releaseCancel := context.WithCancel(context.WithoutCancel(homeCtx))
 		releaseFlusher.SetConfigProvider(client.LimiterConfig)
 		releaseFlusher.SetSender(client.PushConcurrencyRelease)
 		releaseDone := make(chan struct{})
@@ -548,15 +530,6 @@ func (s *Service) runHomeSubscriber(homeCtx, parentCtx, drainParent context.Cont
 			defer close(releaseDone)
 			releaseFlusher.Run(releaseCtx)
 		}()
-		stopRelease := func() {
-			releaseCancel()
-			_ = shutdown.Run(drainParent, func() error {
-				closeClient()
-				stopDeadlineClose()
-				return nil
-			})
-			_ = shutdown.Wait(drainParent, releaseDone)
-		}
 		lifetimeCtx, lifetimeCancel := context.WithCancel(homeCtx)
 		queue := newHomeConfigWorkQueue()
 		ready := make(chan struct{})
@@ -598,22 +571,24 @@ func (s *Service) runHomeSubscriber(homeCtx, parentCtx, drainParent context.Cont
 		if plannedRebalance {
 			// Settle issued dispatches before deciding between target takeover and source drain/flush.
 			client.FenceDispatch()
-			settleCtx, cancelSettle := context.WithTimeout(drainParent, settleBound)
+			settleCtx, cancelSettle := context.WithTimeout(context.WithoutCancel(parentCtx), settleBound)
 			errPending = registry.WaitPending(settleCtx)
 			cancelSettle()
 		}
 		lifetimeCancel()
-		_ = shutdown.Wait(drainParent, workerDone)
+		<-workerDone
 		if publisherDone := supervisor.publisherCompletion(); publisherDone != nil {
-			_ = shutdown.Wait(drainParent, publisherDone)
+			<-publisherDone
 		}
 
 		s.detachHomeSubscriberLifetime(client, registry)
 		retry := errRun != nil && homeCtx.Err() == nil
 		if retry {
-			stopRelease()
+			releaseCancel()
+			<-releaseDone
+			client.Close()
 			if !plannedRebalance {
-				settleCtx, cancelSettle := context.WithTimeout(drainParent, settleBound)
+				settleCtx, cancelSettle := context.WithTimeout(context.WithoutCancel(parentCtx), settleBound)
 				errPending = registry.WaitPending(settleCtx)
 				cancelSettle()
 			}
@@ -628,7 +603,7 @@ func (s *Service) runHomeSubscriber(homeCtx, parentCtx, drainParent context.Cont
 			}
 			if client.AmbiguousDispatch() || home.IsMembershipTakeoverUnavailableError(errRun) || legacyProtocol || client.LegacyMembership() {
 				registry.SetReleaseSink(nil)
-				drainCtx, cancelDrain := context.WithTimeout(drainParent, settleBound)
+				drainCtx, cancelDrain := context.WithTimeout(context.WithoutCancel(parentCtx), settleBound)
 				errDrain := registry.Drain(drainCtx)
 				cancelDrain()
 				if errDrain != nil {
@@ -659,14 +634,16 @@ func (s *Service) runHomeSubscriber(homeCtx, parentCtx, drainParent context.Cont
 		}
 
 		drainBound := time.Duration(cancelBound.Load())
-		drainCtx, cancelDrain := context.WithTimeout(drainParent, drainBound)
+		drainCtx, cancelDrain := context.WithTimeout(context.WithoutCancel(parentCtx), drainBound)
 		errDrain := registry.Drain(drainCtx)
 		var errFlush error
 		if errDrain == nil {
 			errFlush = releaseFlusher.Flush(drainCtx)
 		}
 		cancelDrain()
-		stopRelease()
+		releaseCancel()
+		<-releaseDone
+		client.Close()
 		if errDrain != nil {
 			if parentCtx.Err() == nil {
 				log.WithError(errDrain).Error("failed to drain Home execution registry")

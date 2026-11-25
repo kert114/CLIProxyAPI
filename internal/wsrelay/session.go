@@ -216,16 +216,14 @@ func (pr *pendingRequest) close() {
 }
 
 type session struct {
-	conn           *websocket.Conn
-	manager        *Manager
-	provider       string
-	id             string
-	closed         chan struct{}
-	lifetime       chan struct{}
-	invalidateOnce sync.Once
-	closeOnce      sync.Once
-	writeMutex     sync.Mutex
-	pending        sync.Map // map[string]*pendingRequest
+	conn       *websocket.Conn
+	manager    *Manager
+	provider   string
+	id         string
+	closed     chan struct{}
+	closeOnce  sync.Once
+	writeMutex sync.Mutex
+	pending    sync.Map // map[string]*pendingRequest
 }
 
 func newSession(conn *websocket.Conn, mgr *Manager, id string) *session {
@@ -234,7 +232,6 @@ func newSession(conn *websocket.Conn, mgr *Manager, id string) *session {
 		manager:  mgr,
 		provider: "",
 		id:       id,
-		lifetime: make(chan struct{}),
 		closed:   make(chan struct{}),
 	}
 	conn.SetReadLimit(maxInboundMessageLen)
@@ -378,16 +375,7 @@ func (s *session) request(ctx context.Context, msg Message) (<-chan Message, err
 }
 
 func (s *session) cleanup(cause error) {
-	if s.close(cause) && s.manager != nil {
-		s.manager.handleSessionClosed(s, cause)
-	}
-}
-
-// close ends transport ownership. Disconnect callbacks run outside closeOnce.
-func (s *session) close(cause error) bool {
-	closed := false
 	s.closeOnce.Do(func() {
-		closed = true
 		close(s.closed)
 		s.pending.Range(func(key, value any) bool {
 			if actual, loaded := s.pending.LoadAndDelete(key); loaded {
@@ -399,6 +387,8 @@ func (s *session) close(cause error) bool {
 		if s.conn != nil {
 			_ = s.conn.Close()
 		}
+		if s.manager != nil {
+			s.manager.handleSessionClosed(s, cause)
+		}
 	})
-	return closed
 }

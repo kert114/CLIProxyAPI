@@ -227,7 +227,7 @@ func TestEnsureExecutorsForAuth_XAIReplacesExecutorAfterConfigUpdate(t *testing.
 		t.Fatal("expected xai executor before config update")
 	}
 
-	service.applyWatcherConfigUpdate(t.Context(), &config.Config{})
+	service.applyWatcherConfigUpdate(&config.Config{})
 	service.ensureExecutorsForAuth(auth)
 
 	secondExecutor, okSecond := service.coreManager.Executor("xai")
@@ -360,7 +360,7 @@ func TestApplyWatcherConfigUpdate_PreservesExistingWebsocketConnections(t *testi
 					Strategy: "fill-first",
 				},
 			}
-			service.applyWatcherConfigUpdate(t.Context(), reloadedCfg)
+			service.applyWatcherConfigUpdate(reloadedCfg)
 
 			updatedExec, okUpdated := manager.Executor(tt.provider)
 			if !okUpdated || updatedExec == nil {

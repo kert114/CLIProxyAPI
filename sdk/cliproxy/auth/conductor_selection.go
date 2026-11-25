@@ -115,7 +115,7 @@ func authSelectionEligibilityForRequest(ctx context.Context, opts cliproxyexecut
 }
 
 func (e authSelectionEligibility) allows(auth *Auth) bool {
-	if auth == nil || auth.runtimeExpired() {
+	if auth == nil {
 		return false
 	}
 	if e.requiredKind != "" && auth.AuthKind() != e.requiredKind {
@@ -1647,9 +1647,7 @@ func (m *Manager) List() []*Auth {
 	defer m.mu.RUnlock()
 	list := make([]*Auth, 0, len(m.auths))
 	for _, auth := range m.auths {
-		if auth != nil && !auth.runtimeExpired() {
-			list = append(list, auth.Clone())
-		}
+		list = append(list, auth.Clone())
 	}
 	return list
 }
@@ -1662,7 +1660,7 @@ func (m *Manager) GetByID(id string) (*Auth, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	auth, ok := m.auths[id]
-	if !ok || auth == nil || auth.runtimeExpired() {
+	if !ok {
 		return nil, false
 	}
 	return auth.Clone(), true
@@ -1681,7 +1679,7 @@ func (m *Manager) PublishIfRegistrationCurrent(id string, registrationEpoch uint
 	defer releaseMutation()
 	m.mu.RLock()
 	current, ok := m.auths[id]
-	matches := ok && current != nil && !current.runtimeExpired() && modelRegistrationInputsMatch(current, registrationEpoch, prefix, provider, disabled, authKind, attributes)
+	matches := ok && current != nil && modelRegistrationInputsMatch(current, registrationEpoch, prefix, provider, disabled, authKind, attributes)
 	m.mu.RUnlock()
 	if !matches {
 		return false
@@ -1705,7 +1703,7 @@ func (m *Manager) UpdateIfRegistrationCurrent(ctx context.Context, base *Auth, u
 	defer releaseMutation()
 	m.mu.RLock()
 	current, ok := m.auths[base.ID]
-	matches := ok && current != nil && !current.runtimeExpired() && modelRegistrationInputsMatch(current, base.RegistrationEpoch, base.Prefix, base.Provider, base.Disabled || base.Status == StatusDisabled, base.AuthKind(), base.Attributes)
+	matches := ok && current != nil && modelRegistrationInputsMatch(current, base.RegistrationEpoch, base.Prefix, base.Provider, base.Disabled || base.Status == StatusDisabled, base.AuthKind(), base.Attributes)
 	m.mu.RUnlock()
 	if !matches {
 		return nil, false, nil

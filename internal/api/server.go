@@ -9,7 +9,6 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"math"
 	"net"
 	"net/http"
 	"os"
@@ -50,6 +49,7 @@ type Server struct {
 	// muxBaseListener is the shared TCP listener used to serve both HTTP and Redis protocol traffic.
 	listenerMu      sync.Mutex
 	listenerStopped bool
+	rawListener     net.Listener
 	connections     shutdown.Connections
 	muxBaseListener net.Listener
 
@@ -307,50 +307,59 @@ func (s *Server) Start() error {
 	}
 
 	addr := s.server.Addr
+	raw, errListen := s.listen(addr)
+	if errListen != nil {
+		if errors.Is(errListen, net.ErrClosed) {
+			return nil
+		}
+		return fmt.Errorf("failed to start HTTP server: %v", errListen)
+	}
+	var listener net.Listener = trackingListener{Listener: raw, connections: &s.connections}
+
 	cfg := s.getConfig()
-	var tlsConfig *tls.Config
-	if cfg != nil && cfg.TLS.Enable {
+	useTLS := cfg != nil && cfg.TLS.Enable
+	if useTLS {
 		certPath := strings.TrimSpace(cfg.TLS.Cert)
 		keyPath := strings.TrimSpace(cfg.TLS.Key)
 		if certPath == "" || keyPath == "" {
+			if errClose := listener.Close(); errClose != nil {
+				log.Errorf("failed to close listener after TLS validation failure: %v", errClose)
+			}
 			return fmt.Errorf("failed to start HTTPS server: tls.cert or tls.key is empty")
 		}
 		certPair, errLoad := tls.LoadX509KeyPair(certPath, keyPath)
 		if errLoad != nil {
+			if errClose := listener.Close(); errClose != nil {
+				log.Errorf("failed to close listener after TLS key pair load failure: %v", errClose)
+			}
 			return fmt.Errorf("failed to start HTTPS server: %v", errLoad)
 		}
-		tlsConfig = &tls.Config{
+
+		tlsConfig := &tls.Config{
 			Certificates: []tls.Certificate{certPair},
 			NextProtos:   []string{"h2", "http/1.1"},
 		}
-	}
-	// Resolve addresses and read certificates before taking the listener lock.
-	// Binding and publication must be atomic with respect to Stop.
-	tcpAddr, errResolve := net.ResolveTCPAddr("tcp", addr)
-	if errResolve != nil {
-		return fmt.Errorf("failed to start HTTP server: %v", errResolve)
-	}
-	s.listenerMu.Lock()
-	if s.listenerStopped {
-		s.listenerMu.Unlock()
-		return nil
-	}
-	listener, errListen := net.ListenTCP("tcp", tcpAddr)
-	if errListen != nil {
-		s.listenerMu.Unlock()
-		return fmt.Errorf("failed to start HTTP server: %v", errListen)
-	}
-	httpListener := newMuxListener(listener.Addr(), 1024)
-	s.muxBaseListener = listener
-	s.muxHTTPListener = httpListener
-	s.listenerMu.Unlock()
-
-	if tlsConfig != nil {
 		s.server.TLSConfig = tlsConfig
 		if errHTTP2 := http2.ConfigureServer(s.server, &http2.Server{}); errHTTP2 != nil {
 			log.Warnf("failed to configure HTTP/2: %v", errHTTP2)
 		}
+		listener = tls.NewListener(listener, tlsConfig)
+		log.Debugf("Starting API server on %s with TLS", addr)
+	} else {
+		log.Debugf("Starting API server on %s", addr)
 	}
+
+	httpListener := newMuxListener(listener.Addr(), 1024)
+	s.listenerMu.Lock()
+	if s.listenerStopped {
+		s.listenerMu.Unlock()
+		_ = raw.Close()
+		return nil
+	}
+	s.rawListener = raw
+	s.muxBaseListener = listener
+	s.muxHTTPListener = httpListener
+	s.listenerMu.Unlock()
 
 	httpErrCh := make(chan error, 1)
 	acceptErrCh := make(chan error, 1)
@@ -359,7 +368,7 @@ func (s *Server) Start() error {
 		httpErrCh <- s.server.Serve(httpListener)
 	}()
 	go func() {
-		acceptErrCh <- s.acceptMuxConnectionsWithTLS(listener, httpListener, tlsConfig)
+		acceptErrCh <- s.acceptMuxConnections(listener, httpListener)
 	}()
 
 	select {
@@ -395,13 +404,13 @@ func (s *Server) Start() error {
 		s.muxHTTPListener = nil
 		s.muxBaseListener = nil
 		s.listenerMu.Unlock()
+		if muxHTTP != nil {
+			_ = muxHTTP.Close()
+		}
 		if muxBase != nil {
 			if errClose := muxBase.Close(); errClose != nil && !errors.Is(errClose, net.ErrClosed) {
 				log.Debugf("failed to close shared listener after accept loop exit: %v", errClose)
 			}
-		}
-		if muxHTTP != nil {
-			_ = muxHTTP.Close()
 		}
 		errServe := <-httpErrCh
 		errServe = normalizeHTTPServeError(errServe)
@@ -416,57 +425,88 @@ func (s *Server) Start() error {
 	}
 }
 
-// ShutdownTimeoutSeconds returns the drain budget from the active server config.
-func (s *Server) ShutdownTimeoutSeconds() int {
-	if cfg := s.getConfig(); cfg != nil {
-		return cfg.ShutdownTimeoutSeconds
+// listen publishes a positive-mode listener before TLS setup or logging can
+// block. Only the native TCP bind runs under the listener lock.
+func (s *Server) listen(addr string) (net.Listener, error) {
+	if cfg := s.getConfig(); cfg == nil || cfg.ShutdownTimeoutSeconds <= 0 {
+		return net.Listen("tcp", addr)
 	}
-	return 0
+	tcpAddr, err := net.ResolveTCPAddr("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	s.listenerMu.Lock()
+	defer s.listenerMu.Unlock()
+	if s.listenerStopped {
+		return nil, net.ErrClosed
+	}
+	listener, err := net.ListenTCP("tcp", tcpAddr)
+	if err != nil {
+		return nil, err
+	}
+	s.rawListener = listener
+	return listener, nil
+}
+
+// StopAccepting permanently closes the raw TCP listener. It leaves admitted
+// requests and upgraded connections alive for Drain.
+func (s *Server) StopAccepting() {
+	s.listenerMu.Lock()
+	defer s.listenerMu.Unlock()
+	if s.listenerStopped {
+		return
+	}
+	s.listenerStopped = true
+	if s.muxHTTPListener != nil {
+		s.muxHTTPListener.interrupt.Store(true)
+	}
+	if s.rawListener != nil {
+		_ = s.rawListener.Close()
+	} else if s.muxBaseListener != nil {
+		_ = s.muxBaseListener.Close()
+	}
 }
 
 // Stop closes listeners and shuts down the API server.
-// When server.shutdown-timeout is a positive number of seconds, Stop first lets
-// in-flight requests finish within that budget (http.Server.Shutdown), then
-// forcibly closes whatever remains. The default 0 closes immediately, preserving
-// the behavior introduced to prevent hanging on active requests (#6094).
-//
-// Parameters:
-//   - ctx: Context bounding the whole stop operation.
-//
-// Returns:
-//   - error: An error if the server fails to stop
 func (s *Server) Stop(ctx context.Context) error {
-	return s.StopWithDrainTimeout(ctx, s.ShutdownTimeoutSeconds())
+	if cfg := s.getConfig(); cfg != nil && cfg.ShutdownTimeoutSeconds > 0 {
+		return s.StopWithDrainTimeout(ctx, cfg.ShutdownTimeoutSeconds)
+	}
+	return s.stopLegacy()
 }
 
-// StopWithDrainTimeout uses a caller's snapshot of the shutdown timeout so the
-// drain budget matches the service's teardown order even during a config reload.
-func (s *Server) StopWithDrainTimeout(ctx context.Context, drainTimeout int) error {
-	if drainTimeout <= 0 {
-		return s.stopLegacy(ctx)
+func (s *Server) StopWithDrainTimeout(ctx context.Context, seconds int) error {
+	if seconds <= 0 {
+		return s.stopLegacy()
 	}
+	s.StopAccepting()
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	drainBudget := time.Duration(min(int64(drainTimeout), math.MaxInt64/int64(time.Second))) * time.Second
-	drainCtx, cancel := context.WithTimeout(ctx, drainBudget)
+	budget := config.ShutdownDuration(seconds)
+	drainCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
-	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < drainBudget {
-		remaining := max(0, time.Until(deadline)).Round(time.Millisecond)
-		go log.WithFields(log.Fields{
-			"shutdown_timeout_seconds": drainTimeout,
-			"remaining":                remaining,
-		}).Warn("HTTP drain limited by shutdown context deadline")
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < budget {
+		go log.Warn("HTTP drain limited by shutdown context deadline")
 	}
+	return s.Drain(drainCtx)
+}
 
-	muxHTTP, muxBase := s.detachListeners(true)
-	if muxBase != nil {
-		_ = muxBase.Close()
+// Drain finishes admitted HTTP requests within ctx. StopAccepting must run first.
+func (s *Server) Drain(ctx context.Context) error {
+	if s.keepAliveEnabled {
+		select {
+		case s.keepAliveStop <- struct{}{}:
+		default:
+		}
 	}
+	s.listenerMu.Lock()
+	muxHTTP := s.muxHTTPListener
+	s.listenerMu.Unlock()
 	// net/http can wait for a TLS close alert even on an idle connection.
 	// Its shutdown context doesn't interrupt a Close already in progress.
 	interrupted := make(chan struct{})
-	stopInterrupt := context.AfterFunc(drainCtx, func() {
+	stopInterrupt := context.AfterFunc(ctx, func() {
 		s.connections.Close()
 		close(interrupted)
 	})
@@ -475,7 +515,7 @@ func (s *Server) StopWithDrainTimeout(ctx context.Context, drainTimeout int) err
 	}
 	var errShutdown error
 	if s.server != nil {
-		errShutdown = s.server.Shutdown(drainCtx)
+		errShutdown = s.server.Shutdown(ctx)
 	}
 	if stopInterrupt() {
 		// Also includes sockets still sniffing and connections transferred
@@ -494,7 +534,7 @@ func (s *Server) StopWithDrainTimeout(ctx context.Context, drainTimeout int) err
 		errShutdown = nil
 	}
 	if s.codexLiveHandler != nil {
-		s.codexLiveHandler.CloseContext(drainCtx)
+		s.codexLiveHandler.Close()
 	}
 	if errShutdown != nil {
 		return fmt.Errorf("failed to shutdown HTTP server: %w", errShutdown)
@@ -502,30 +542,22 @@ func (s *Server) StopWithDrainTimeout(ctx context.Context, drainTimeout int) err
 	return nil
 }
 
-func (s *Server) detachListeners(bounded bool) (*muxListener, net.Listener) {
+func (s *Server) stopLegacy() error {
+	log.Debug("Stopping API server...")
+
 	if s.keepAliveEnabled {
 		select {
 		case s.keepAliveStop <- struct{}{}:
 		default:
 		}
 	}
+
 	s.listenerMu.Lock()
-	defer s.listenerMu.Unlock()
-	if bounded {
-		s.listenerStopped = true
-		if s.muxHTTPListener != nil {
-			s.muxHTTPListener.interrupt.Store(true)
-		}
-	}
-	muxHTTP, muxBase := s.muxHTTPListener, s.muxBaseListener
-	s.muxHTTPListener, s.muxBaseListener = nil, nil
-	return muxHTTP, muxBase
-}
-
-func (s *Server) stopLegacy(ctx context.Context) error {
-	log.Debug("Stopping API server...")
-
-	muxHTTP, muxBase := s.detachListeners(false)
+	muxHTTP := s.muxHTTPListener
+	s.muxHTTPListener = nil
+	muxBase := s.muxBaseListener
+	s.muxBaseListener = nil
+	s.listenerMu.Unlock()
 
 	if muxHTTP != nil {
 		_ = muxHTTP.Close()

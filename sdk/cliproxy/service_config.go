@@ -46,10 +46,8 @@ func (s *Service) applyConfigUpdate(newCfg *config.Config) {
 	s.applyConfigUpdateWithAuthSynthesis(context.Background(), newCfg, true)
 }
 
-func (s *Service) applyWatcherConfigUpdate(ctx context.Context, newCfg *config.Config) {
-	if ctx.Err() == nil {
-		s.applyConfigUpdateWithAuthSynthesis(ctx, newCfg, false)
-	}
+func (s *Service) applyWatcherConfigUpdate(newCfg *config.Config) {
+	s.applyConfigUpdateWithAuthSynthesis(context.Background(), newCfg, false)
 }
 
 type configCommit struct {
@@ -166,11 +164,8 @@ func (s *Service) commitConfigUpdate(newCfg *config.Config) configCommit {
 	newCfg = newCfg.CloneForRuntime()
 	helps.AdvanceProxyPoolGeneration(s.proxyPoolPublisher, newCfg)
 	s.cfgMu.Lock()
-	if s.stopping {
-		s.cfgMu.Unlock()
-		return configCommit{}
-	}
 	s.cfg = newCfg
+	s.shutdownConfig.Store(newCfg)
 	s.cfgMu.Unlock()
 	s.cancelStaleAntigravityProbes("")
 	s.configSequence++
@@ -216,7 +211,7 @@ func (s *Service) applyConfigRuntime(ctx context.Context, commit configCommit, s
 	}
 	s.applyDiscoveryConfigContext(ctx, cfg)
 	if s.kvStoreManaged.Load() {
-		s.applyKVStoreConfigContext(ctx, cfg)
+		s.applyKVStoreConfig(cfg)
 	}
 	if errContext := ctx.Err(); errContext != nil {
 		return false

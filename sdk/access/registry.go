@@ -25,8 +25,6 @@ var (
 	registry          = make(map[string]Provider)
 	order             []string
 	exclusiveProvider string
-	exclusiveOwner    any
-	providerOwners    = make(map[string]any)
 )
 
 // RegisterProvider registers a pre-built provider instance for a given type identifier.
@@ -41,7 +39,6 @@ func RegisterProvider(typ string, provider Provider) {
 		order = append(order, normalizedType)
 	}
 	registry[normalizedType] = provider
-	delete(providerOwners, normalizedType)
 	registryMu.Unlock()
 }
 
@@ -52,12 +49,10 @@ func UnregisterProvider(typ string) {
 		return
 	}
 	registryMu.Lock()
-	removeProviderLocked(normalizedType)
-	registryMu.Unlock()
-}
-
-func removeProviderLocked(normalizedType string) {
-	delete(providerOwners, normalizedType)
+	if _, exists := registry[normalizedType]; !exists {
+		registryMu.Unlock()
+		return
+	}
 	delete(registry, normalizedType)
 	for index := range order {
 		if order[index] != normalizedType {
@@ -66,6 +61,7 @@ func removeProviderLocked(normalizedType string) {
 		order = append(order[:index], order[index+1:]...)
 		break
 	}
+	registryMu.Unlock()
 }
 
 // SetExclusiveProvider restricts RegisteredProviders to a single provider key when present.
@@ -73,7 +69,6 @@ func SetExclusiveProvider(typ string) {
 	normalizedType := strings.TrimSpace(typ)
 	registryMu.Lock()
 	exclusiveProvider = normalizedType
-	exclusiveOwner = nil
 	registryMu.Unlock()
 }
 
@@ -81,41 +76,7 @@ func SetExclusiveProvider(typ string) {
 func ClearExclusiveProvider() {
 	registryMu.Lock()
 	exclusiveProvider = ""
-	exclusiveOwner = nil
 	registryMu.Unlock()
-}
-
-// OwnedProvider identifies one registration installed by a plugin host.
-type OwnedProvider struct {
-	Key      string
-	Provider Provider
-}
-
-// ReplaceOwnedProviders publishes a host's providers and its exclusivity in one
-// registry operation. Older hosts may only remove their own registrations.
-func ReplaceOwnedProviders(owner any, providers []OwnedProvider, exclusive string) {
-	registryMu.Lock()
-	defer registryMu.Unlock()
-	next := make(map[string]struct{}, len(providers))
-	for _, registration := range providers {
-		key := registration.Key
-		if _, exists := registry[key]; !exists {
-			order = append(order, key)
-		}
-		registry[key] = registration.Provider
-		providerOwners[key] = owner
-		next[key] = struct{}{}
-	}
-	for key, current := range providerOwners {
-		if _, keep := next[key]; current == owner && !keep {
-			removeProviderLocked(key)
-		}
-	}
-	if exclusive != "" {
-		exclusiveProvider, exclusiveOwner = exclusive, owner
-	} else if exclusiveOwner == owner {
-		exclusiveProvider, exclusiveOwner = "", nil
-	}
 }
 
 // RegisteredProviders returns the global provider instances in registration order.

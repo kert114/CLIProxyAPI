@@ -32,26 +32,23 @@ type pluginAuthParserHolder struct {
 	parser PluginAuthParser
 }
 
-var pluginAuthParserValue atomic.Pointer[pluginAuthParserHolder]
+var pluginAuthParserValue atomic.Value
 
 // RegisterPluginAuthParser registers the current plugin auth parser.
 func RegisterPluginAuthParser(parser PluginAuthParser) {
-	pluginAuthParserValue.Store(&pluginAuthParserHolder{parser: parser})
-}
-
-// ClearPluginAuthParser removes parser only if it is still installed.
-func ClearPluginAuthParser(parser PluginAuthParser) {
-	holder := pluginAuthParserValue.Load()
-	if holder != nil && holder.parser == parser {
-		pluginAuthParserValue.CompareAndSwap(holder, nil)
-	}
+	pluginAuthParserValue.Store(pluginAuthParserHolder{parser: parser})
 }
 
 func currentPluginAuthParser() PluginAuthParser {
-	if holder := pluginAuthParserValue.Load(); holder != nil {
-		return holder.parser
+	value := pluginAuthParserValue.Load()
+	if value == nil {
+		return nil
 	}
-	return nil
+	holder, ok := value.(pluginAuthParserHolder)
+	if !ok {
+		return nil
+	}
+	return holder.parser
 }
 
 // FileTokenStore persists token records and auth metadata using the filesystem as backing storage.

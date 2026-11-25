@@ -1280,7 +1280,7 @@ func TestSessionStoreCloseAllReleasesMediaAndResources(t *testing.T) {
 		return nil
 	})
 
-	store.closeAllContext(t.Context(), "test_shutdown")
+	store.closeAll("test_shutdown")
 
 	if !mediaSession.closed.Load() {
 		t.Fatal("closeAll() did not close the media session")

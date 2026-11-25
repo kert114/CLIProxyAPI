@@ -112,7 +112,7 @@ func TestServiceApplyKVStoreConfig_LifecycleAndHotReload(t *testing.T) {
 	nilSvc.applyKVStoreConfig(&config.Config{
 		KVStore: config.KVStoreConfig{Disabled: false, Path: dbPath1},
 	})
-	if errNilShutdown := nilSvc.shutdownKVStore(t.Context()); errNilShutdown != nil {
+	if errNilShutdown := nilSvc.shutdownKVStore(); errNilShutdown != nil {
 		t.Fatalf("nilSvc.shutdownKVStore() error = %v; want nil", errNilShutdown)
 	}
 }
@@ -163,29 +163,5 @@ func TestServiceApplyKVStoreConfig_HomeModeNeverOpensBBolt(t *testing.T) {
 	home.ClearCurrent()
 	if client, active, errClient := kvstore.CurrentKVClient(); client != nil || active || errClient != nil {
 		t.Fatalf("expected local store shut down when home.Current() was active, got %v, %v, %v", client, active, errClient)
-	}
-}
-
-func TestServiceShutdownPreservesReplacementKVStore(t *testing.T) {
-	t.Cleanup(func() { _ = kvstore.ShutdownLocal() })
-	newService := func() *Service {
-		t.Helper()
-		cfg := &config.Config{AuthDir: t.TempDir(), ShutdownTimeoutSeconds: 1}
-		service, err := NewBuilder().WithConfig(cfg).WithConfigPath(filepath.Join(cfg.AuthDir, "test.yaml")).Build()
-		if err != nil {
-			t.Fatal(err)
-		}
-		service.applyKVStoreConfig(cfg)
-		return service
-	}
-	old := newService()
-	replacement := newService()
-	t.Cleanup(func() { _ = replacement.Shutdown(context.Background()) })
-	want, _, _ := kvstore.CurrentKVClient()
-	if err := old.Shutdown(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if got, active, err := kvstore.CurrentKVClient(); err != nil || !active || got == nil || got != want {
-		t.Fatalf("departed service removed replacement's store: active=%v err=%v", active, err)
 	}
 }

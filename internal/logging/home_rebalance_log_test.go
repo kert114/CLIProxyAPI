@@ -27,7 +27,7 @@ func TestHomeRebalanceLogPreservesPlanAndAddressesLocallyAndWhenForwarded(t *tes
 	logger.Infof("executing Home rebalance plan: plan=%q from=%q to=%q", "plan-1", "home-1:8327", "home-2:8327")
 	select {
 	case payload := <-forwarder.queue:
-		forwarder.forward(t.Context(), payload)
+		forwarder.forward(payload)
 	default:
 		t.Fatal("rebalance log was not queued for Home")
 	}

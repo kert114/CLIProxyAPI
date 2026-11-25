@@ -411,7 +411,7 @@ func (c *Client) detachClientsLocked() (*redis.Client, *redis.Client, []*homeDis
 
 func closeDetachedClients(commandClient *redis.Client, subscriptionClient *redis.Client, connections []*homeDispatchConn) {
 	for _, conn := range connections {
-		_ = closeUnderlyingTransport(conn)
+		_ = conn.Close()
 	}
 	if commandClient != nil {
 		_ = commandClient.Close()
@@ -642,7 +642,7 @@ func (c *homeDispatchConn) Close() error {
 	if c == nil || c.Conn == nil {
 		return net.ErrClosed
 	}
-	defer c.untrack()
+	c.untrack()
 	return c.Conn.Close()
 }
 
@@ -1535,22 +1535,10 @@ func (c *Client) concurrencyReleaseClient() (*redis.Client, error) {
 	if errOptions != nil {
 		return nil, errOptions
 	}
-	dialer := redis.NewDialer(options)
-	options.Dialer = func(ctx context.Context, network, address string) (net.Conn, error) {
-		conn, errDial := dialer(ctx, network, address)
-		if errDial != nil {
-			return nil, errDial
-		}
-		return &homeReleaseConn{Conn: conn}, nil
-	}
+	options.Dialer = redis.NewDialer(options)
 	c.release = redis.NewClient(options)
 	return c.release, nil
 }
-
-// homeReleaseConn interrupts stalled release I/O without waiting for TLS close-notify.
-type homeReleaseConn struct{ net.Conn }
-
-func (c *homeReleaseConn) Close() error { return closeUnderlyingTransport(c.Conn) }
 
 func (c *Client) RPushRequestLog(ctx context.Context, payload []byte) error {
 	cmd, errClient := c.commandClient()

@@ -4,9 +4,9 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/shutdown"
-	"time"
 )
 
 type muxListener struct {
@@ -152,4 +152,19 @@ func (l *muxListener) closeConn(conn net.Conn) {
 	} else {
 		_ = conn.Close()
 	}
+}
+
+// trackingListener tracks native TCP below TLS so only owned sockets are
+// interrupted at the end of a drain. It also covers sniffers and upgrades.
+type trackingListener struct {
+	net.Listener
+	connections *shutdown.Connections
+}
+
+func (l trackingListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return l.connections.Track(conn)
 }

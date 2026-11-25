@@ -2070,7 +2070,7 @@ func (f *testHomeLogForwarder) bindCount() int {
 	return f.binds
 }
 
-func (f *testHomeLogForwarder) StopContext(context.Context) {
+func (f *testHomeLogForwarder) Stop() {
 	f.stops.Add(1)
 }
 
@@ -2188,7 +2188,7 @@ func TestDetachHomeSubscriberLifetimeKeepsNewForwarderForStaleClient(t *testing.
 		homeLogForwarderClient: currentClient,
 	}
 
-	staleForwarder.StopContext(t.Context())
+	staleForwarder.Stop()
 	service.detachHomeSubscriberLifetime(staleClient, staleRegistry)
 
 	service.homeMu.Lock()
@@ -3006,7 +3006,7 @@ func TestServiceSerializesHomeAndWatcherConfigRuntimeApply(t *testing.T) {
 
 	watcherDone := make(chan struct{})
 	go func() {
-		service.applyWatcherConfigUpdate(t.Context(), &config.Config{Routing: internalconfig.RoutingConfig{Strategy: "round-robin"}})
+		service.applyWatcherConfigUpdate(&config.Config{Routing: internalconfig.RoutingConfig{Strategy: "round-robin"}})
 		close(watcherDone)
 	}()
 	select {
