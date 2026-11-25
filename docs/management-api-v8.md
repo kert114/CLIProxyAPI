@@ -401,5 +401,6 @@ agent counts and jobs. Unreachable enrolled hosts may include a last successful
 snapshot with their current status and reason.
 
 If the dashboard is unreachable or cannot return a valid snapshot, the endpoint
-returns HTTP 503 with `code=agent_activity_unavailable`. A non-loopback
-management request returns HTTP 403 with `code=agent_activity_local_only`.
+returns HTTP 503 with `error=agent_activity_unavailable`. A non-loopback
+management request returns HTTP 403 with `error=agent_activity_local_only`.
+Both errors include a human-readable `message`.

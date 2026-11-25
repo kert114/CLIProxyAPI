@@ -14,14 +14,17 @@ func (h *Handler) GetAgentActivity(c *gin.Context) {
 	c.Header("Cache-Control", "no-store")
 	host, _, errAddress := net.SplitHostPort(c.Request.RemoteAddr)
 	if errAddress != nil || !net.ParseIP(host).IsLoopback() {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Agent activity is available only on localhost", "code": "agent_activity_local_only"})
+		c.JSON(http.StatusForbidden, gin.H{
+			"error":   "agent_activity_local_only",
+			"message": "Agent activity is available only on localhost",
+		})
 		return
 	}
 	data, errFetch := agentactivity.Fetch(c.Request.Context(), os.Getenv("AGENT_ACTIVITY_URL"))
 	if errFetch != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{
-			"error": "Agent activity dashboard is unavailable. Make sure agent-activity serve is running.",
-			"code":  "agent_activity_unavailable",
+			"error":   "agent_activity_unavailable",
+			"message": "Agent activity dashboard is unavailable. Make sure agent-activity serve is running.",
 		})
 		return
 	}

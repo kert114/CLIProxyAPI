@@ -58,7 +58,7 @@ func TestAgentActivityV8(t *testing.T) {
 			if tc.want == http.StatusOK && (!bytes.Equal(w.Body.Bytes(), fixture) || w.Header().Get("Cache-Control") != "no-store") {
 				t.Fatal("successful response must return the upstream snapshot without caching")
 			}
-			if tc.want == http.StatusForbidden && ojson.GetBytes(w.Body.Bytes(), "code").String() != "agent_activity_local_only" {
+			if tc.want == http.StatusForbidden && ojson.GetBytes(w.Body.Bytes(), "error").String() != "agent_activity_local_only" {
 				t.Fatal("remote request did not hit the direct loopback check")
 			}
 		})
@@ -70,7 +70,8 @@ func TestAgentActivityV8(t *testing.T) {
 	req.Header.Set("X-Management-Key", "test-management-password")
 	w := httptest.NewRecorder()
 	s.engine.ServeHTTP(w, req)
-	if w.Code != http.StatusServiceUnavailable || ojson.GetBytes(w.Body.Bytes(), "code").String() != "agent_activity_unavailable" {
+	if w.Code != http.StatusServiceUnavailable || ojson.GetBytes(w.Body.Bytes(), "error").String() != "agent_activity_unavailable" ||
+		ojson.GetBytes(w.Body.Bytes(), "message").String() == "" {
 		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
 	}
 }
