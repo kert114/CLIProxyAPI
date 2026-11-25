@@ -185,8 +185,20 @@ func (s *Service) commitConfigUpdate(newCfg *config.Config) configCommit {
 	s.cfgMu.Unlock()
 	s.cancelStaleAntigravityProbes("")
 	s.configSequence++
-	if !s.admissionStopped() {
-		registry.UpdateModelCatalogSources(newCfg.Models, newCfg.Home.Enabled)
+	if s.admissionStopped() {
+		return configCommit{}
+	}
+	published := registry.UpdateModelCatalogSourcesGuarded(newCfg.Models, newCfg.Home.Enabled, func(publish func()) bool {
+		s.admissionMu.Lock()
+		defer s.admissionMu.Unlock()
+		if s.admissionStopped() {
+			return false
+		}
+		publish()
+		return true
+	})
+	if !published {
+		return configCommit{}
 	}
 	return configCommit{cfg: newCfg, sequence: s.configSequence}
 }

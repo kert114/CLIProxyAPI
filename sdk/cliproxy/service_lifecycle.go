@@ -662,18 +662,24 @@ func (s *Service) shutdownResources(ctx context.Context, stopAPI bool) error {
 	}
 
 	if s.pluginHost != nil {
+		pluginCtx := ctx
+		if !stopAPI {
+			// Callers can stop waiting, but teardown must acquire the apply lock
+			// and finish before a later Shutdown can report success.
+			pluginCtx = context.WithoutCancel(ctx)
+		}
 		sdktranslator.SetPluginHooks(nil)
 		sdkAuth.RegisterPluginAuthParser(nil)
 		if watcher := s.currentWatcher(); watcher != nil {
 			watcher.SetPluginAuthParser(nil)
 		}
-		s.pluginHost.ApplyConfig(ctx, &config.Config{})
-		s.pluginHost.RegisterModels(ctx, registry.GetGlobalRegistry())
-		s.registerAvailableExecutors(ctx, executorRegistrationOptions{
+		s.pluginHost.ApplyConfig(pluginCtx, &config.Config{})
+		s.pluginHost.RegisterModels(pluginCtx, registry.GetGlobalRegistry())
+		s.registerAvailableExecutors(pluginCtx, executorRegistrationOptions{
 			includePlugins: true,
 		})
 		s.pluginHost.RegisterFrontendAuthProviders()
-		s.pluginHost.ShutdownAllContext(ctx)
+		s.pluginHost.ShutdownAllContext(pluginCtx)
 		if s.accessManager != nil {
 			s.accessManager.SetProviders(sdkaccess.RegisteredProviders())
 		}

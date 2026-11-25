@@ -400,13 +400,28 @@ func StartModelCatalogUpdaters(ctx context.Context, sources CatalogSources, home
 // UpdateModelCatalogSources updates an already-started process policy on reload.
 // Updates before service startup or after shutdown do not start readers.
 func UpdateModelCatalogSources(sources CatalogSources, home bool) {
+	UpdateModelCatalogSourcesGuarded(sources, home, nil)
+}
+
+// UpdateModelCatalogSourcesGuarded calls publishIfActive after acquiring the
+// catalog lock. The guard must publish synchronously to accept the update and
+// return true. Reader reconfiguration runs after the guard releases its lock.
+func UpdateModelCatalogSourcesGuarded(sources CatalogSources, home bool, publishIfActive func(publish func()) bool) bool {
 	catalogRuntime.Lock()
 	defer catalogRuntime.Unlock()
-	catalogRuntime.sources = sources
-	catalogRuntime.home = home
+	publish := func() {
+		catalogRuntime.sources = sources
+		catalogRuntime.home = home
+	}
+	if publishIfActive == nil {
+		publish()
+	} else if !publishIfActive(publish) {
+		return false
+	}
 	if catalogRuntime.ctx != nil && catalogRuntime.ctx.Err() == nil {
 		configureCatalogs(catalogRuntime.ctx, sources, catalogRuntime.local, home)
 	}
+	return true
 }
 
 // RefreshModelCatalogs triggers an immediate on-demand refresh across all model catalog updaters.

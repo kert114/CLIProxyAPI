@@ -156,7 +156,7 @@ func (p *pprofServer) shutdown(ctx context.Context, legacy bool) error {
 	if legacy {
 		return p.stopServerWithContext(ctx, currentServer, currentAddr, "shutdown")
 	}
-	return shutdownPprofServer(ctx, currentServer, currentAddr, "shutdown")
+	return shutdownPprofServer(ctx, currentServer, currentAddr, "shutdown", true)
 }
 
 func (p *pprofServer) startServer(addr string, owner uint64) *http.Server {
@@ -254,11 +254,12 @@ func (p *pprofServer) stopServerWithContext(ctx context.Context, server *http.Se
 	}
 	stopCtx, cancel := context.WithTimeout(stopCtx, 5*time.Second)
 	defer cancel()
-	return shutdownPprofServer(stopCtx, server, addr, reason)
+	return shutdownPprofServer(stopCtx, server, addr, reason, false)
 }
 
-func shutdownPprofServer(ctx context.Context, server *http.Server, addr string, reason string) error {
-	if errStop := server.Shutdown(ctx); errStop != nil {
+func shutdownPprofServer(ctx context.Context, server *http.Server, addr string, reason string, listenerClosed bool) error {
+	// net/http may still track a listener closed by closePprofListeners.
+	if errStop := server.Shutdown(ctx); errStop != nil && !(listenerClosed && errors.Is(errStop, net.ErrClosed)) {
 		log.Errorf("pprof server stop failed on %s: %v", addr, errStop)
 		return errStop
 	}
