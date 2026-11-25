@@ -23,8 +23,9 @@ import (
 )
 
 type homeSubscriberSupervisor struct {
-	cancel context.CancelFunc
-	done   chan struct{}
+	cancel      context.CancelFunc
+	cancelDrain context.CancelFunc
+	done        chan struct{}
 
 	publisherMu   sync.Mutex
 	publisherDone <-chan struct{}
@@ -419,15 +420,17 @@ func (s *Service) startHomeSubscriber(ctx context.Context) {
 	}
 
 	homeCtx, cancel := context.WithCancel(parentCtx)
+	// Draining can outlive the subscription but must stop at the service deadline.
+	drainCtx, cancelDrain := context.WithCancel(context.WithoutCancel(parentCtx))
 	done := make(chan struct{})
 	s.homeMu.Lock()
 	s.homeGeneration++
 	generation := s.homeGeneration
 	s.homeCancel = cancel
 	s.homeMu.Unlock()
-	supervisor := &homeSubscriberSupervisor{cancel: cancel, done: done}
+	supervisor := &homeSubscriberSupervisor{cancel: cancel, cancelDrain: cancelDrain, done: done}
 	s.homeSupervisor = supervisor
-	go s.runHomeSubscriber(homeCtx, parentCtx, cfg.Home, generation, supervisor)
+	go s.runHomeSubscriber(homeCtx, parentCtx, drainCtx, cfg.Home, generation, supervisor)
 }
 
 func (s *Service) drainDetachedHomeLifetime(parentCtx context.Context) bool {
@@ -481,7 +484,7 @@ func (s *Service) drainDetachedHomeLifetime(parentCtx context.Context) bool {
 	return true
 }
 
-func (s *Service) runHomeSubscriber(homeCtx context.Context, parentCtx context.Context, homeCfg internalconfig.HomeConfig, generation uint64, supervisor *homeSubscriberSupervisor) {
+func (s *Service) runHomeSubscriber(homeCtx, parentCtx, drainParent context.Context, homeCfg internalconfig.HomeConfig, generation uint64, supervisor *homeSubscriberSupervisor) {
 	defer func() {
 		s.homeMu.Lock()
 		if s.homeGeneration == generation {
@@ -490,6 +493,7 @@ func (s *Service) runHomeSubscriber(homeCtx context.Context, parentCtx context.C
 		s.homeMu.Unlock()
 		close(supervisor.done)
 	}()
+	defer supervisor.cancelDrain()
 
 	var previousClient *home.Client
 	var retryBackoff homeSubscriberRetryBackoff
@@ -504,7 +508,7 @@ func (s *Service) runHomeSubscriber(homeCtx context.Context, parentCtx context.C
 		if drainBound <= 0 {
 			drainBound = internalconfig.CredentialConcurrencyConfig{}.WithDefaults().CPACancelBound
 		}
-		drainCtx, cancelDrain := context.WithTimeout(context.WithoutCancel(parentCtx), drainBound)
+		drainCtx, cancelDrain := context.WithTimeout(drainParent, drainBound)
 		errDrain := registry.Drain(drainCtx)
 		cancelDrain()
 		if errDrain != nil && !errors.Is(errDrain, executionregistry.ErrRegistryClosed) && parentCtx.Err() == nil {
@@ -571,7 +575,7 @@ func (s *Service) runHomeSubscriber(homeCtx context.Context, parentCtx context.C
 		if plannedRebalance {
 			// Settle issued dispatches before deciding between target takeover and source drain/flush.
 			client.FenceDispatch()
-			settleCtx, cancelSettle := context.WithTimeout(context.WithoutCancel(parentCtx), settleBound)
+			settleCtx, cancelSettle := context.WithTimeout(drainParent, settleBound)
 			errPending = registry.WaitPending(settleCtx)
 			cancelSettle()
 		}
@@ -588,7 +592,7 @@ func (s *Service) runHomeSubscriber(homeCtx context.Context, parentCtx context.C
 			<-releaseDone
 			client.Close()
 			if !plannedRebalance {
-				settleCtx, cancelSettle := context.WithTimeout(context.WithoutCancel(parentCtx), settleBound)
+				settleCtx, cancelSettle := context.WithTimeout(drainParent, settleBound)
 				errPending = registry.WaitPending(settleCtx)
 				cancelSettle()
 			}
@@ -603,7 +607,7 @@ func (s *Service) runHomeSubscriber(homeCtx context.Context, parentCtx context.C
 			}
 			if client.AmbiguousDispatch() || home.IsMembershipTakeoverUnavailableError(errRun) || legacyProtocol || client.LegacyMembership() {
 				registry.SetReleaseSink(nil)
-				drainCtx, cancelDrain := context.WithTimeout(context.WithoutCancel(parentCtx), settleBound)
+				drainCtx, cancelDrain := context.WithTimeout(drainParent, settleBound)
 				errDrain := registry.Drain(drainCtx)
 				cancelDrain()
 				if errDrain != nil {
@@ -634,7 +638,7 @@ func (s *Service) runHomeSubscriber(homeCtx context.Context, parentCtx context.C
 		}
 
 		drainBound := time.Duration(cancelBound.Load())
-		drainCtx, cancelDrain := context.WithTimeout(context.WithoutCancel(parentCtx), drainBound)
+		drainCtx, cancelDrain := context.WithTimeout(drainParent, drainBound)
 		errDrain := registry.Drain(drainCtx)
 		var errFlush error
 		if errDrain == nil {

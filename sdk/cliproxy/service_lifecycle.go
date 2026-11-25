@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api"
@@ -39,15 +40,23 @@ func (s *Service) Run(ctx context.Context) error {
 		ctx = context.Background()
 	}
 	ctx, runCancel := context.WithCancel(ctx)
-	// The caller can cancel Run to start shutdown while HTTP requests still
-	// need the runtime workers. Shutdown cancels them after the opt-in drain.
-	runtimeCtx, runtimeCancel := context.WithCancel(context.WithoutCancel(ctx))
+	// Use the same live timeout for parent cancellation and HTTP teardown.
+	drainTimeout := sync.OnceValue(s.shutdownTimeoutSeconds)
+	runtimeCtx, cancelRuntime := context.WithCancelCause(context.WithoutCancel(ctx))
+	runtimeCancel := func() { cancelRuntime(context.Cause(ctx)) }
+	stopRuntimeCancel := context.AfterFunc(ctx, func() {
+		if drainTimeout() <= 0 {
+			runtimeCancel()
+		}
+	})
+	defer stopRuntimeCancel()
 	s.cfgMu.Lock()
 	s.antigravityContext = runtimeCtx
 	s.cfgMu.Unlock()
 	s.homeMu.Lock()
 	s.runCancel = runCancel
 	s.runtimeCancel = runtimeCancel
+	s.runDrainTimeout = drainTimeout
 	s.homeMu.Unlock()
 	defer func() {
 		runCancel()
@@ -55,6 +64,7 @@ func (s *Service) Run(ctx context.Context) error {
 		s.homeMu.Lock()
 		s.runCancel = nil
 		s.runtimeCancel = nil
+		s.runDrainTimeout = nil
 		s.homeMu.Unlock()
 	}()
 
@@ -140,7 +150,10 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	// handlers no longer depend on legacy clients; pass nil slice initially
-	s.server = api.NewServer(cfg, s.coreManager, s.accessManager, s.configPath, s.serverOptions...)
+	server := api.NewServer(cfg, s.coreManager, s.accessManager, s.configPath, s.serverOptions...)
+	s.cfgMu.Lock()
+	s.server = server
+	s.cfgMu.Unlock()
 	s.syncPluginRuntimeConfig(ctx)
 	if homeEnabled {
 		s.configRuntimeMu.Lock()
@@ -251,6 +264,18 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 }
 
+func (s *Service) shutdownTimeoutSeconds() int {
+	s.cfgMu.RLock()
+	server := s.server
+	if server == nil && s.cfg != nil {
+		timeout := s.cfg.ShutdownTimeoutSeconds
+		s.cfgMu.RUnlock()
+		return timeout
+	}
+	s.cfgMu.RUnlock()
+	return server.ShutdownTimeoutSeconds()
+}
+
 // Shutdown stops background workers and shuts down the HTTP server.
 // It ensures all resources are properly cleaned up and connections are closed.
 // The shutdown is idempotent and can be called multiple times safely.
@@ -270,25 +295,32 @@ func (s *Service) Shutdown(ctx context.Context) error {
 			ctx = context.Background()
 		}
 
-		drainTimeout := s.server.ShutdownTimeoutSeconds()
+		s.homeMu.Lock()
+		runCancel := s.runCancel
+		runtimeCancel := s.runtimeCancel
+		runDrainTimeout := s.runDrainTimeout
+		s.homeMu.Unlock()
+		if runDrainTimeout == nil {
+			runDrainTimeout = s.shutdownTimeoutSeconds
+		}
+		drainTimeout := runDrainTimeout()
+		s.cfgMu.RLock()
+		server := s.server
+		s.cfgMu.RUnlock()
 		stopServer := func() {
-			if errStop := s.server.StopWithDrainTimeout(ctx, drainTimeout); errStop != nil {
+			if errStop := server.StopWithDrainTimeout(ctx, drainTimeout); errStop != nil {
 				log.Errorf("error stopping API server: %v", errStop)
 				if shutdownErr == nil {
 					shutdownErr = errStop
 				}
 			}
 		}
-		if drainTimeout > 0 {
+		if server != nil && drainTimeout > 0 {
 			// Close the proxy listeners before waiting on pprof or stopping
 			// resources used by active requests, including the WebSocket relay.
 			stopServer()
 		}
 
-		s.homeMu.Lock()
-		runCancel := s.runCancel
-		runtimeCancel := s.runtimeCancel
-		s.homeMu.Unlock()
 		if runCancel != nil {
 			runCancel()
 		}
@@ -297,11 +329,17 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		}
 
 		s.homeLifecycleMu.Lock()
+		homeSupervisorPending := false
 		if supervisor := s.homeSupervisor; supervisor != nil {
-			s.homeConfigCommitMu.Lock()
 			supervisor.cancel()
-			s.homeConfigCommitMu.Unlock()
-			<-supervisor.done
+			select {
+			case <-supervisor.done:
+			case <-ctx.Done():
+				if supervisor.cancelDrain != nil {
+					supervisor.cancelDrain()
+				}
+				homeSupervisorPending = true
+			}
 		}
 		s.homeMu.Lock()
 		homeCancel := s.homeCancel
@@ -326,13 +364,18 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		if homeCancel != nil {
 			homeCancel()
 		}
-		if homeRegistry != nil {
+		// A supervisor still exiting owns the registry drain and client close.
+		if homeRegistry != nil && !homeSupervisorPending {
 			if errClose := homeRegistry.Close(); errClose != nil {
 				log.WithError(errClose).Warn("failed to close Home execution registry during shutdown")
 			}
 		}
 		if homeClient != nil {
-			homeClient.Close()
+			if homeSupervisorPending {
+				homeClient.FenceDispatch()
+			} else {
+				homeClient.Close()
+			}
 		}
 		if homeForwarder != nil {
 			if homeForwarderClient == homeClient {
@@ -390,7 +433,7 @@ func (s *Service) Shutdown(ctx context.Context) error {
 
 		// no legacy clients to persist
 
-		if s.server != nil && drainTimeout <= 0 {
+		if server != nil && drainTimeout <= 0 {
 			stopServer()
 		}
 

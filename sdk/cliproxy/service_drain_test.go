@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -18,8 +19,99 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/wsrelay"
 )
+
+func TestServiceShutdown_BoundsHomeDrainAndSupervisorWait(t *testing.T) {
+	listener, errListen := net.Listen("tcp", "127.0.0.1:0")
+	if errListen != nil {
+		t.Fatal(errListen)
+	}
+	stop := make(chan struct{})
+	t.Cleanup(func() {
+		close(stop)
+		_ = listener.Close()
+		home.ClearCurrent()
+	})
+	go func() {
+		for {
+			conn, errAccept := listener.Accept()
+			if errAccept != nil {
+				return
+			}
+			go serveHomeShutdownConn(conn, stop)
+		}
+	}()
+
+	service := newRegistryTestService(t, listener)
+	service.startHomeSubscriber(t.Context())
+	supervisor := service.homeSupervisor
+	t.Cleanup(func() {
+		supervisor.cancel()
+		select {
+		case <-supervisor.done:
+		case <-time.After(5 * time.Second):
+			t.Error("Home supervisor did not exit during cleanup")
+		}
+	})
+	registry := waitForServiceRegistry(t, service, 5*time.Second)
+	pending, errBegin := registry.BeginDispatch()
+	if errBegin != nil {
+		t.Fatal(errBegin)
+	}
+	defer pending.End()
+
+	// Model HTTP having already used all but this much of the service deadline.
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	shutdownDone := make(chan struct{})
+	go func() {
+		defer close(shutdownDone)
+		_ = service.Shutdown(ctx)
+	}()
+	bound := time.After(time.Second)
+	select {
+	case <-shutdownDone:
+	case <-bound:
+		t.Fatal("Shutdown waited past its deadline for a pending Home dispatch")
+	}
+	select {
+	case <-supervisor.done:
+	case <-bound:
+		t.Fatal("Home supervisor kept draining after the service deadline")
+	}
+}
+
+func serveHomeShutdownConn(conn net.Conn, stop <-chan struct{}) {
+	defer func() { _ = conn.Close() }()
+	reader := bufio.NewReader(conn)
+	for {
+		args, errRead := readRegistryTestRedisCommand(reader)
+		if errRead != nil {
+			return
+		}
+		var reply string
+		switch {
+		case len(args) > 0 && strings.EqualFold(args[0], "HELLO"):
+			reply = "%6\r\n$6\r\nserver\r\n$5\r\nredis\r\n$5\r\nproto\r\n:3\r\n$2\r\nid\r\n:1\r\n$4\r\nmode\r\n$10\r\nstandalone\r\n$4\r\nrole\r\n$6\r\nmaster\r\n$7\r\nmodules\r\n*0\r\n"
+		case len(args) >= 2 && strings.EqualFold(args[0], "GET") && args[1] == "config":
+			writeRegistryTestConfig(conn, "credential-concurrency:\n  lifecycle-config-revision: 1\n  cpa-cancel-bound: 3s\n")
+			continue
+		case len(args) >= 2 && strings.EqualFold(args[0], "GET") && args[1] == "plugin-tasks":
+			reply = "$2\r\n[]\r\n"
+		case len(args) >= 2 && strings.EqualFold(args[0], "SUBSCRIBE") && args[1] == "config":
+			_, _ = io.WriteString(conn, "*3\r\n$9\r\nsubscribe\r\n$6\r\nconfig\r\n:1\r\n")
+			<-stop
+			return
+		default:
+			reply = "+OK\r\n"
+		}
+		if _, errWrite := io.WriteString(conn, reply); errWrite != nil {
+			return
+		}
+	}
+}
 
 func TestServiceShutdown_DrainsRelayBackedStream(t *testing.T) {
 	relay := wsrelay.NewManager(wsrelay.Options{

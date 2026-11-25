@@ -134,6 +134,7 @@ type Service struct {
 	homeCancel                   context.CancelFunc
 	runCancel                    context.CancelFunc
 	runtimeCancel                context.CancelFunc
+	runDrainTimeout              func() int
 	homeLogForwarder             homeLogForwarder
 	homeLogForwarderClient       *home.Client
 	homePluginSyncMu             sync.Mutex
