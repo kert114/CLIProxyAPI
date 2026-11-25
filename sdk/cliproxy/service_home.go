@@ -14,6 +14,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/shutdown"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/watcher/diff"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
@@ -123,7 +124,7 @@ func (q *homeConfigWorkQueue) tryDequeueLatest() ([]byte, bool) {
 type homeLogForwarder interface {
 	Bind(*home.Client)
 	Deactivate(*home.Client)
-	Stop()
+	StopContext(context.Context)
 }
 
 var startHomeLogForwarder = func(queueSize int) homeLogForwarder {
@@ -410,7 +411,12 @@ func (s *Service) startHomeSubscriber(ctx context.Context) {
 		s.homeConfigCommitMu.Lock()
 		previousSupervisor.cancel()
 		s.homeConfigCommitMu.Unlock()
-		<-previousSupervisor.done
+		if shutdown.Wait(parentCtx, previousSupervisor.done) != nil {
+			if previousSupervisor.cancelDrain != nil {
+				previousSupervisor.cancelDrain()
+			}
+			return
+		}
 	}
 	if !s.drainDetachedHomeLifetime(parentCtx) {
 		return
@@ -464,7 +470,7 @@ func (s *Service) drainDetachedHomeLifetime(parentCtx context.Context) bool {
 		if previousDrainBound <= 0 {
 			previousDrainBound = internalconfig.CredentialConcurrencyConfig{}.WithDefaults().CPACancelBound
 		}
-		drainCtx, cancelDrain := context.WithTimeout(context.WithoutCancel(parentCtx), previousDrainBound)
+		drainCtx, cancelDrain := context.WithTimeout(parentCtx, previousDrainBound)
 		errDrain := previousRegistry.Drain(drainCtx)
 		cancelDrain()
 		if errDrain != nil {
@@ -526,7 +532,11 @@ func (s *Service) runHomeSubscriber(homeCtx, parentCtx, drainParent context.Cont
 			client = client.NewLifetime()
 		}
 		client.SetManagedLifetime(true)
-		releaseCtx, releaseCancel := context.WithCancel(context.WithoutCancel(homeCtx))
+		// The active lifetime can be detached before its drain completes.
+		// Keep ownership of its sockets here so service expiry still interrupts I/O.
+		closeClient := sync.OnceFunc(client.Close)
+		stopDeadlineClose := context.AfterFunc(drainParent, closeClient)
+		releaseCtx, releaseCancel := context.WithCancel(drainParent)
 		releaseFlusher.SetConfigProvider(client.LimiterConfig)
 		releaseFlusher.SetSender(client.PushConcurrencyRelease)
 		releaseDone := make(chan struct{})
@@ -534,6 +544,15 @@ func (s *Service) runHomeSubscriber(homeCtx, parentCtx, drainParent context.Cont
 			defer close(releaseDone)
 			releaseFlusher.Run(releaseCtx)
 		}()
+		stopRelease := func() {
+			releaseCancel()
+			_ = shutdown.Run(drainParent, func() error {
+				closeClient()
+				stopDeadlineClose()
+				return nil
+			})
+			_ = shutdown.Wait(drainParent, releaseDone)
+		}
 		lifetimeCtx, lifetimeCancel := context.WithCancel(homeCtx)
 		queue := newHomeConfigWorkQueue()
 		ready := make(chan struct{})
@@ -580,17 +599,15 @@ func (s *Service) runHomeSubscriber(homeCtx, parentCtx, drainParent context.Cont
 			cancelSettle()
 		}
 		lifetimeCancel()
-		<-workerDone
+		_ = shutdown.Wait(drainParent, workerDone)
 		if publisherDone := supervisor.publisherCompletion(); publisherDone != nil {
-			<-publisherDone
+			_ = shutdown.Wait(drainParent, publisherDone)
 		}
 
 		s.detachHomeSubscriberLifetime(client, registry)
 		retry := errRun != nil && homeCtx.Err() == nil
 		if retry {
-			releaseCancel()
-			<-releaseDone
-			client.Close()
+			stopRelease()
 			if !plannedRebalance {
 				settleCtx, cancelSettle := context.WithTimeout(drainParent, settleBound)
 				errPending = registry.WaitPending(settleCtx)
@@ -645,9 +662,7 @@ func (s *Service) runHomeSubscriber(homeCtx, parentCtx, drainParent context.Cont
 			errFlush = releaseFlusher.Flush(drainCtx)
 		}
 		cancelDrain()
-		releaseCancel()
-		<-releaseDone
-		client.Close()
+		stopRelease()
 		if errDrain != nil {
 			if parentCtx.Err() == nil {
 				log.WithError(errDrain).Error("failed to drain Home execution registry")

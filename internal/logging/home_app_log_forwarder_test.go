@@ -51,15 +51,16 @@ func (c *stubHomeAppLogClient) pushedAt(index int) []byte {
 
 func TestHomeAppLogForwarder_ForwardsFormattedLogWhenBoundOwnerIsHealthy(t *testing.T) {
 	stub := &stubHomeAppLogClient{heartbeatOK: true}
+	ctx, cancel := context.WithCancel(t.Context())
 	forwarder := &HomeAppLogForwarder{
 		formatter: &LogFormatter{},
 		queue:     make(chan homeAppLogPayload, 4),
-		stop:      make(chan struct{}),
+		cancel:    cancel,
+		done:      make(chan struct{}),
 	}
 	forwarder.enabled.Store(true)
 	forwarder.bind(stub)
-	forwarder.wg.Add(1)
-	go forwarder.run()
+	go forwarder.run(ctx)
 	defer forwarder.Stop()
 
 	entry := log.NewEntry(log.StandardLogger())
@@ -166,14 +167,15 @@ func homeAppLogForwarderTargetCount() int {
 func TestHomeAppLogForwarder_RebindsOnlyToCurrentOwner(t *testing.T) {
 	first := &stubHomeAppLogClient{heartbeatOK: true}
 	second := &stubHomeAppLogClient{heartbeatOK: true}
+	ctx, cancel := context.WithCancel(t.Context())
 	forwarder := &HomeAppLogForwarder{
 		formatter: &LogFormatter{},
 		queue:     make(chan homeAppLogPayload, 4),
-		stop:      make(chan struct{}),
+		cancel:    cancel,
+		done:      make(chan struct{}),
 	}
 	forwarder.enabled.Store(true)
-	forwarder.wg.Add(1)
-	go forwarder.run()
+	go forwarder.run(ctx)
 	t.Cleanup(forwarder.Stop)
 
 	forwarder.bind(first)
@@ -237,20 +239,21 @@ func TestHomeAppLogForwarder_DelayedOldOwnerUnsupportedDoesNotDisableNewOwner(t 
 	release := make(chan struct{})
 	oldOwner := &delayedUnsupportedHomeAppLogClient{started: make(chan struct{}), release: release}
 	newOwner := &stubHomeAppLogClient{heartbeatOK: true}
+	ctx, cancel := context.WithCancel(t.Context())
 	forwarder := &HomeAppLogForwarder{
 		formatter: &LogFormatter{},
 		queue:     make(chan homeAppLogPayload, 1),
-		stop:      make(chan struct{}),
+		cancel:    cancel,
+		done:      make(chan struct{}),
 	}
 	forwarder.enabled.Store(true)
-	forwarder.wg.Add(1)
-	go forwarder.run()
+	go forwarder.run(ctx)
 	t.Cleanup(forwarder.Stop)
 
 	forwarder.bind(oldOwner)
 	forwardDone := make(chan struct{})
 	go func() {
-		forwarder.forward(homeAppLogPayload{Line: "old owner", client: oldOwner})
+		forwarder.forward(t.Context(), homeAppLogPayload{Line: "old owner", client: oldOwner})
 		close(forwardDone)
 	}()
 
@@ -271,7 +274,7 @@ func TestHomeAppLogForwarder_DelayedOldOwnerUnsupportedDoesNotDisableNewOwner(t 
 		t.Fatal("old owner unsupported response disabled the new owner")
 	}
 
-	forwarder.forward(homeAppLogPayload{Line: "new owner", client: newOwner})
+	forwarder.forward(t.Context(), homeAppLogPayload{Line: "new owner", client: newOwner})
 	waitForHomeAppLogPush(t, newOwner, 1)
 }
 
@@ -283,7 +286,6 @@ func TestHomeAppLogForwarder_UnboundNeverUsesGlobalFallbackClient(t *testing.T) 
 	forwarder := &HomeAppLogForwarder{
 		formatter: &LogFormatter{},
 		queue:     make(chan homeAppLogPayload, 1),
-		stop:      make(chan struct{}),
 	}
 	forwarder.enabled.Store(true)
 
@@ -307,7 +309,6 @@ func TestHomeAppLogForwarder_DropsPreACKAndReconnectGapLogs(t *testing.T) {
 	preACKForwarder := &HomeAppLogForwarder{
 		formatter: &LogFormatter{},
 		queue:     make(chan homeAppLogPayload, 1),
-		stop:      make(chan struct{}),
 	}
 	preACKForwarder.enabled.Store(true)
 	if client := preACKForwarder.client(); client != nil {
@@ -346,7 +347,6 @@ func TestHomeAppLogForwarder_SkipsWhenBoundOwnerHeartbeatIsDown(t *testing.T) {
 	forwarder := &HomeAppLogForwarder{
 		formatter: &LogFormatter{},
 		queue:     make(chan homeAppLogPayload, 4),
-		stop:      make(chan struct{}),
 	}
 	forwarder.enabled.Store(true)
 	forwarder.bind(stub)
@@ -372,12 +372,11 @@ func TestHomeAppLogForwarder_DisablesForwardingWhenBoundOwnerDoesNotSupportAppLo
 	forwarder := &HomeAppLogForwarder{
 		formatter: &LogFormatter{},
 		queue:     make(chan homeAppLogPayload, 4),
-		stop:      make(chan struct{}),
 	}
 	forwarder.enabled.Store(true)
 	forwarder.bind(stub)
 
-	forwarder.forward(homeAppLogPayload{Line: "legacy home cannot receive app logs"})
+	forwarder.forward(t.Context(), homeAppLogPayload{Line: "legacy home cannot receive app logs"})
 	if forwarder.enabled.Load() {
 		t.Fatal("forwarder still enabled, want disabled after unsupported app-log response")
 	}

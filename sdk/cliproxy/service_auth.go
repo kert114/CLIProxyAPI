@@ -384,8 +384,8 @@ func (s *Service) wsOnConnected(channelID string) {
 	})
 }
 
-func (s *Service) wsOnDisconnected(channelID string, reason error) {
-	if s == nil || channelID == "" {
+func (s *Service) wsOnDisconnected(ctx context.Context, channelID string, reason error) {
+	if s == nil || channelID == "" || ctx.Err() != nil {
 		return
 	}
 	if reason != nil {
@@ -397,7 +397,6 @@ func (s *Service) wsOnDisconnected(channelID string, reason error) {
 	} else {
 		log.Infof("websocket provider disconnected: %s", channelID)
 	}
-	ctx := context.Background()
 	s.emitAuthUpdate(ctx, watcher.AuthUpdate{
 		Action: watcher.AuthUpdateActionDelete,
 		ID:     channelID,

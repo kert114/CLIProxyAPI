@@ -375,7 +375,16 @@ func (s *session) request(ctx context.Context, msg Message) (<-chan Message, err
 }
 
 func (s *session) cleanup(cause error) {
+	if s.close(cause) && s.manager != nil {
+		s.manager.handleSessionClosed(s, cause)
+	}
+}
+
+// close ends transport ownership. Disconnect callbacks run outside closeOnce.
+func (s *session) close(cause error) bool {
+	closed := false
 	s.closeOnce.Do(func() {
+		closed = true
 		close(s.closed)
 		s.pending.Range(func(key, value any) bool {
 			if actual, loaded := s.pending.LoadAndDelete(key); loaded {
@@ -387,8 +396,6 @@ func (s *session) cleanup(cause error) {
 		if s.conn != nil {
 			_ = s.conn.Close()
 		}
-		if s.manager != nil {
-			s.manager.handleSessionClosed(s, cause)
-		}
 	})
+	return closed
 }

@@ -110,8 +110,9 @@ type Service struct {
 	// pluginHost owns dynamic plugin lifecycle and runtime capability adapters.
 	pluginHost *pluginhost.Host
 
-	// shutdownOnce ensures shutdown is called only once.
+	// shutdownOnce elects one shutdown caller and publishes its completion signal.
 	shutdownOnce sync.Once
+	shutdownDone chan struct{}
 
 	// wsGateway manages websocket Gemini providers.
 	wsGateway *wsrelay.Manager

@@ -1,19 +1,24 @@
 package kvstore
 
 import (
+	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/shutdown"
 
 	log "github.com/sirupsen/logrus"
 )
 
 var (
-	controllerMu sync.RWMutex
-	homeProvider func() (KVClient, bool, error)
-	localEnabled bool
-	localStore   *BoltStore
-	localPath    string
-	localErr     error
+	controllerMu    sync.RWMutex
+	localGeneration atomic.Uint64
+	homeProvider    func() (KVClient, bool, error)
+	localEnabled    bool
+	localStore      *BoltStore
+	localPath       string
+	localErr        error
 )
 
 // RegisterHomeProvider registers the callback used by CurrentKVClient to inspect
@@ -28,6 +33,7 @@ func RegisterHomeProvider(fn func() (KVClient, bool, error)) {
 func ConfigureLocal(enabled bool, rawPath string) error {
 	controllerMu.Lock()
 	defer controllerMu.Unlock()
+	localGeneration.Add(1)
 
 	if !enabled {
 		return shutdownLocalLocked()
@@ -81,6 +87,21 @@ func ShutdownLocal() error {
 	controllerMu.Lock()
 	defer controllerMu.Unlock()
 	return shutdownLocalLocked()
+}
+
+// ShutdownLocalContext stops waiting when ctx expires. bbolt still owns the
+// open database until transactions finish, so the close continues in background.
+func ShutdownLocalContext(ctx context.Context) error {
+	generation := localGeneration.Load()
+	return shutdown.Run(ctx, func() error {
+		controllerMu.Lock()
+		defer controllerMu.Unlock()
+		// A config applied while the caller was waiting owns its store.
+		if localGeneration.Load() != generation {
+			return nil
+		}
+		return shutdownLocalLocked()
+	})
 }
 
 func shutdownLocalLocked() error {

@@ -112,7 +112,7 @@ func TestServiceApplyKVStoreConfig_LifecycleAndHotReload(t *testing.T) {
 	nilSvc.applyKVStoreConfig(&config.Config{
 		KVStore: config.KVStoreConfig{Disabled: false, Path: dbPath1},
 	})
-	if errNilShutdown := nilSvc.shutdownKVStore(); errNilShutdown != nil {
+	if errNilShutdown := nilSvc.shutdownKVStore(t.Context()); errNilShutdown != nil {
 		t.Fatalf("nilSvc.shutdownKVStore() error = %v; want nil", errNilShutdown)
 	}
 }

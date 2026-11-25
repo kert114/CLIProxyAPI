@@ -14,6 +14,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/shutdown"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v8/sdk/access"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
@@ -22,6 +23,8 @@ import (
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	log "github.com/sirupsen/logrus"
 )
+
+const serviceShutdownTimeout = 30 * time.Second
 
 // Run starts the service and blocks until the context is cancelled or the server stops.
 // It initializes all components including authentication, file watching, HTTP server,
@@ -83,9 +86,7 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	defer func() {
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer shutdownCancel()
-		if errShutdown := s.Shutdown(shutdownCtx); errShutdown != nil {
+		if errShutdown := s.Shutdown(context.Background()); errShutdown != nil {
 			log.Errorf("service shutdown returned error: %v", errShutdown)
 		}
 	}()
@@ -219,7 +220,8 @@ func (s *Service) Run(ctx context.Context) error {
 
 	if !homeEnabled {
 		var watcherWrapper *WatcherWrapper
-		reloadCallback := func(newCfg *config.Config) { s.applyWatcherConfigUpdate(newCfg) }
+		watcherCtx, watcherCancel := context.WithCancel(runtimeCtx)
+		reloadCallback := func(newCfg *config.Config) { s.applyWatcherConfigUpdate(watcherCtx, newCfg) }
 
 		authDir := ""
 		if currentCfg := s.currentConfig(); currentCfg != nil {
@@ -227,6 +229,7 @@ func (s *Service) Run(ctx context.Context) error {
 		}
 		watcherWrapper, errCreate := s.watcherFactory(s.configPath, authDir, reloadCallback)
 		if errCreate != nil {
+			watcherCancel()
 			return fmt.Errorf("cliproxy: failed to create watcher: %w", errCreate)
 		}
 		s.setWatcher(watcherWrapper)
@@ -237,7 +240,6 @@ func (s *Service) Run(ctx context.Context) error {
 		watcherWrapper.SetConfig(s.currentConfig())
 		s.registerPluginAuthParser()
 
-		watcherCtx, watcherCancel := context.WithCancel(context.Background())
 		s.cfgMu.Lock()
 		s.watcherCancel = watcherCancel
 		s.cfgMu.Unlock()
@@ -289,183 +291,189 @@ func (s *Service) Shutdown(ctx context.Context) error {
 	if s == nil {
 		return nil
 	}
-	var shutdownErr error
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, serviceShutdownTimeout)
+	defer cancel()
+	first := false
 	s.shutdownOnce.Do(func() {
-		if ctx == nil {
-			ctx = context.Background()
-		}
-
-		s.homeMu.Lock()
-		runCancel := s.runCancel
-		runtimeCancel := s.runtimeCancel
-		runDrainTimeout := s.runDrainTimeout
-		s.homeMu.Unlock()
-		if runDrainTimeout == nil {
-			runDrainTimeout = s.shutdownTimeoutSeconds
-		}
-		drainTimeout := runDrainTimeout()
-		s.cfgMu.RLock()
-		server := s.server
-		s.cfgMu.RUnlock()
-		stopServer := func() {
-			if errStop := server.StopWithDrainTimeout(ctx, drainTimeout); errStop != nil {
-				log.Errorf("error stopping API server: %v", errStop)
-				if shutdownErr == nil {
-					shutdownErr = errStop
-				}
-			}
-		}
-		if server != nil && drainTimeout > 0 {
-			// Close the proxy listeners before waiting on pprof or stopping
-			// resources used by active requests, including the WebSocket relay.
-			stopServer()
-		}
-
-		if runCancel != nil {
-			runCancel()
-		}
-		if runtimeCancel != nil {
-			runtimeCancel()
-		}
-
-		s.homeLifecycleMu.Lock()
-		homeSupervisorPending := false
-		if supervisor := s.homeSupervisor; supervisor != nil {
-			supervisor.cancel()
-			select {
-			case <-supervisor.done:
-			case <-ctx.Done():
-				if supervisor.cancelDrain != nil {
-					supervisor.cancelDrain()
-				}
-				homeSupervisorPending = true
-			}
-		}
-		s.homeMu.Lock()
-		homeCancel := s.homeCancel
-		homeClient := s.homeClient
-		homeRegistry := s.homeRegistry
-		homeDispatchBundle := s.homeDispatchBundle
-		homeForwarder := s.homeLogForwarder
-		homeForwarderClient := s.homeLogForwarderClient
-		s.homeGeneration++
-		s.homeCancel = nil
-		s.homeClient = nil
-		s.homeRegistry = nil
-		s.homeDispatchBundle = nil
-		s.homeDrainBound = 0
-		s.homeLogForwarder = nil
-		s.homeLogForwarderClient = nil
-		s.homeMu.Unlock()
-		if s.coreManager != nil {
-			s.coreManager.ClearHomeDispatchBundle(homeDispatchBundle)
-		}
-		home.ClearCurrentIf(homeClient)
-		if homeCancel != nil {
-			homeCancel()
-		}
-		// A supervisor still exiting owns the registry drain and client close.
-		if homeRegistry != nil && !homeSupervisorPending {
-			if errClose := homeRegistry.Close(); errClose != nil {
-				log.WithError(errClose).Warn("failed to close Home execution registry during shutdown")
-			}
-		}
-		if homeClient != nil {
-			if homeSupervisorPending {
-				homeClient.FenceDispatch()
-			} else {
-				homeClient.Close()
-			}
-		}
-		if homeForwarder != nil {
-			if homeForwarderClient == homeClient {
-				homeForwarder.Deactivate(homeClient)
-			}
-			homeForwarder.Stop()
-		}
-		s.homeLifecycleMu.Unlock()
-
-		// legacy refresh loop removed; only stopping core auth manager below
-
-		s.cfgMu.RLock()
-		watcherCancel := s.watcherCancel
-		s.cfgMu.RUnlock()
-		if watcherCancel != nil {
-			watcherCancel()
-		}
-		if s.coreManager != nil {
-			s.coreManager.StopAutoRefresh()
-		}
-		if watcher := s.currentWatcher(); watcher != nil {
-			if err := watcher.Stop(); err != nil {
-				log.Errorf("failed to stop file watcher: %v", err)
-				if shutdownErr == nil {
-					shutdownErr = err
-				}
-			}
-		}
-		if s.wsGateway != nil {
-			if err := s.wsGateway.Stop(ctx); err != nil {
-				log.Errorf("failed to stop websocket gateway: %v", err)
-				if shutdownErr == nil {
-					shutdownErr = err
-				}
-			}
-		}
-		if s.authQueueStop != nil {
-			s.authQueueStop()
-			s.authQueueStop = nil
-		}
-
-		if errShutdownPprof := s.shutdownPprof(ctx); errShutdownPprof != nil {
-			log.Errorf("failed to stop pprof server: %v", errShutdownPprof)
-			if shutdownErr == nil {
-				shutdownErr = errShutdownPprof
-			}
-		}
-
-		if errShutdownDiscovery := s.shutdownDiscovery(); errShutdownDiscovery != nil {
-			log.Errorf("failed to stop discovery advertiser: %v", errShutdownDiscovery)
-			if shutdownErr == nil {
-				shutdownErr = errShutdownDiscovery
-			}
-		}
-
-		// no legacy clients to persist
-
-		if server != nil && drainTimeout <= 0 {
-			stopServer()
-		}
-
-		if s.pluginHost != nil {
-			sdktranslator.SetPluginHooks(nil)
-			sdkAuth.RegisterPluginAuthParser(nil)
-			if watcher := s.currentWatcher(); watcher != nil {
-				watcher.SetPluginAuthParser(nil)
-			}
-			s.pluginHost.ApplyConfig(ctx, &config.Config{})
-			s.pluginHost.RegisterModels(ctx, registry.GetGlobalRegistry())
-			s.registerAvailableExecutors(ctx, executorRegistrationOptions{
-				includePlugins: true,
-			})
-			s.pluginHost.RegisterFrontendAuthProviders()
-			s.pluginHost.ShutdownAllContext(ctx)
-			if s.accessManager != nil {
-				s.accessManager.SetProviders(sdkaccess.RegisteredProviders())
-			}
-		}
-
-		if errShutdownKV := s.shutdownKVStore(); errShutdownKV != nil {
-			log.Errorf("failed to stop local kv store: %v", errShutdownKV)
-			if shutdownErr == nil {
-				shutdownErr = errShutdownKV
-			}
-		}
-
-		helps.RetireProxyPoolPublisher(s.proxyPoolPublisher)
-		usage.StopDefault()
+		first = true
+		s.shutdownDone = make(chan struct{})
 	})
+	if !first {
+		return shutdown.Wait(ctx, s.shutdownDone)
+	}
+	defer close(s.shutdownDone)
+
+	s.homeMu.Lock()
+	runCancel := s.runCancel
+	runtimeCancel := s.runtimeCancel
+	runDrainTimeout := s.runDrainTimeout
+	s.homeMu.Unlock()
+	if runDrainTimeout == nil {
+		runDrainTimeout = s.shutdownTimeoutSeconds
+	}
+	drainTimeout := runDrainTimeout()
+	s.cfgMu.RLock()
+	server := s.server
+	watcherCancel := s.watcherCancel
+	s.cfgMu.RUnlock()
+
+	var shutdownErr error
+	recordError := func(component string, err error) {
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(err, ctxErr) {
+				log.WithError(err).Debugf("stopped waiting for %s", component)
+			} else {
+				log.WithError(err).Errorf("failed to stop %s", component)
+			}
+			if shutdownErr == nil {
+				shutdownErr = err
+			}
+		}
+	}
+	if server != nil && drainTimeout > 0 {
+		// Keep the request dependencies alive while the HTTP listener drains.
+		recordError("API server", server.StopWithDrainTimeout(ctx, drainTimeout))
+	}
+	if runCancel != nil {
+		runCancel()
+	}
+	if runtimeCancel != nil {
+		runtimeCancel()
+	}
+	if watcherCancel != nil {
+		watcherCancel()
+	}
+	if server != nil && drainTimeout <= 0 {
+		recordError("API server", server.StopWithDrainTimeout(ctx, drainTimeout))
+	}
+
+	// Native transports must be closed even if the HTTP drain used the entire
+	// deadline. The legacy component APIs below continue their cleanup if the
+	// caller runs out of time to wait for a callback, filesystem, or library.
+	if s.homeLifecycleMu.TryLock() {
+		s.shutdownHome(ctx)
+		s.homeLifecycleMu.Unlock()
+	} else {
+		recordError("Home workers", shutdown.Run(ctx, func() error {
+			s.homeLifecycleMu.Lock()
+			defer s.homeLifecycleMu.Unlock()
+			s.shutdownHome(ctx)
+			return nil
+		}))
+	}
+	if s.wsGateway != nil {
+		recordError("websocket gateway", s.wsGateway.Stop(ctx))
+	}
+	recordError("pprof server", s.shutdownPprof(ctx))
+
+	if s.coreManager != nil {
+		recordError("auth refresh and selector", shutdown.Run(ctx, func() error {
+			s.coreManager.StopAutoRefresh()
+			return nil
+		}))
+	}
+	if watcher := s.currentWatcher(); watcher != nil {
+		recordError("file watcher", shutdown.Run(ctx, watcher.Stop))
+	}
+	if s.authQueueStop != nil {
+		s.authQueueStop()
+		s.authQueueStop = nil
+	}
+	recordError("discovery advertiser", s.shutdownDiscovery(ctx))
+
+	if s.pluginHost != nil {
+		recordError("plugins", shutdown.Run(ctx, func() error {
+			s.shutdownPlugins(ctx)
+			return nil
+		}))
+	}
+	if s.kvStoreManaged.Swap(false) {
+		recordError("local kv store", s.shutdownKVStore(ctx))
+	}
+	helps.RetireProxyPoolPublisher(s.proxyPoolPublisher)
+	usage.StopDefault()
 	return shutdownErr
+}
+
+func (s *Service) shutdownHome(ctx context.Context) {
+	homeSupervisorPending := false
+	if supervisor := s.homeSupervisor; supervisor != nil {
+		supervisor.cancel()
+		select {
+		case <-supervisor.done:
+		case <-ctx.Done():
+			if supervisor.cancelDrain != nil {
+				supervisor.cancelDrain()
+			}
+			homeSupervisorPending = true
+		}
+	}
+	s.homeMu.Lock()
+	homeCancel := s.homeCancel
+	homeClient := s.homeClient
+	homeRegistry := s.homeRegistry
+	homeDispatchBundle := s.homeDispatchBundle
+	homeForwarder := s.homeLogForwarder
+	homeForwarderClient := s.homeLogForwarderClient
+	s.homeGeneration++
+	s.homeCancel = nil
+	s.homeClient = nil
+	s.homeRegistry = nil
+	s.homeDispatchBundle = nil
+	s.homeDrainBound = 0
+	s.homeLogForwarder = nil
+	s.homeLogForwarderClient = nil
+	s.homeMu.Unlock()
+	if s.coreManager != nil {
+		s.coreManager.ClearHomeDispatchBundle(homeDispatchBundle)
+	}
+	home.ClearCurrentIf(homeClient)
+	if homeCancel != nil {
+		homeCancel()
+	}
+	// A supervisor still exiting owns the registry drain and client close.
+	if homeClient != nil {
+		if homeSupervisorPending {
+			homeClient.FenceDispatch()
+		} else {
+			_ = shutdown.Run(ctx, func() error {
+				homeClient.Close()
+				return nil
+			})
+		}
+	}
+	if homeForwarder != nil {
+		if homeForwarderClient == homeClient {
+			homeForwarder.Deactivate(homeClient)
+		}
+		homeForwarder.StopContext(ctx)
+	}
+	if homeRegistry != nil && !homeSupervisorPending {
+		if errClose := shutdown.Run(ctx, homeRegistry.Close); errClose != nil {
+			log.WithError(errClose).Warn("failed to close Home execution registry during shutdown")
+		}
+	}
+}
+
+func (s *Service) shutdownPlugins(ctx context.Context) {
+	sdktranslator.SetPluginHooks(nil)
+	sdkAuth.RegisterPluginAuthParser(nil)
+	if watcher := s.currentWatcher(); watcher != nil {
+		watcher.SetPluginAuthParser(nil)
+	}
+	s.pluginHost.ApplyConfig(ctx, &config.Config{})
+	s.pluginHost.RegisterModels(ctx, registry.GetGlobalRegistry())
+	s.registerAvailableExecutors(ctx, executorRegistrationOptions{
+		includePlugins: true,
+	})
+	s.pluginHost.RegisterFrontendAuthProviders()
+	s.pluginHost.ShutdownAllContext(ctx)
+	if s.accessManager != nil {
+		s.accessManager.SetProviders(sdkaccess.RegisteredProviders())
+	}
 }
 
 func (s *Service) ensureAuthDir() error {

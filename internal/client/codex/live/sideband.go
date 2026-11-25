@@ -18,6 +18,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/shutdown"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
@@ -188,7 +189,7 @@ func (s *sessionStore) complete(session liveSession, reason string) {
 	endLiveSession(entry.session, reason)
 }
 
-func (s *sessionStore) closeAll(reason string) {
+func (s *sessionStore) closeAllContext(ctx context.Context, reason string) {
 	if s == nil {
 		return
 	}
@@ -202,9 +203,17 @@ func (s *sessionStore) closeAll(reason string) {
 		entries = append(entries, entry)
 	}
 	s.mu.Unlock()
-	for _, entry := range entries {
-		endLiveSession(entry.session, reason)
+	if len(entries) == 0 {
+		return
 	}
+	_ = shutdown.Run(ctx, func() error {
+		var workers sync.WaitGroup
+		for _, entry := range entries {
+			workers.Go(func() { endLiveSession(entry.session, reason) })
+		}
+		workers.Wait()
+		return nil
+	})
 }
 
 func (s *sessionStore) expiryDuration() time.Duration {

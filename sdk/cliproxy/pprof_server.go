@@ -200,6 +200,9 @@ func (p *pprofServer) stopServerWithContext(ctx context.Context, server *http.Se
 	stopCtx, cancel := context.WithTimeout(stopCtx, 5*time.Second)
 	defer cancel()
 	if errStop := server.Shutdown(stopCtx); errStop != nil {
+		if errClose := server.Close(); errClose != nil && !errors.Is(errClose, http.ErrServerClosed) {
+			errStop = errors.Join(errStop, errClose)
+		}
 		log.Errorf("pprof server stop failed on %s: %v", addr, errStop)
 		return errStop
 	}

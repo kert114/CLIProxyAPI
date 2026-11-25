@@ -500,7 +500,7 @@ func (s *Server) StopWithDrainTimeout(ctx context.Context, drainTimeout int) err
 		}
 	}
 	if s.codexLiveHandler != nil {
-		s.codexLiveHandler.Close()
+		s.codexLiveHandler.CloseContext(ctx)
 	}
 	if errCloseServer != nil {
 		return fmt.Errorf("failed to shutdown HTTP server: %v", errCloseServer)

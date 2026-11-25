@@ -46,8 +46,10 @@ func (s *Service) applyConfigUpdate(newCfg *config.Config) {
 	s.applyConfigUpdateWithAuthSynthesis(context.Background(), newCfg, true)
 }
 
-func (s *Service) applyWatcherConfigUpdate(newCfg *config.Config) {
-	s.applyConfigUpdateWithAuthSynthesis(context.Background(), newCfg, false)
+func (s *Service) applyWatcherConfigUpdate(ctx context.Context, newCfg *config.Config) {
+	if ctx.Err() == nil {
+		s.applyConfigUpdateWithAuthSynthesis(ctx, newCfg, false)
+	}
 }
 
 type configCommit struct {

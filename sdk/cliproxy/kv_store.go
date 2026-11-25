@@ -1,6 +1,8 @@
 package cliproxy
 
 import (
+	"context"
+
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/kvstore"
@@ -24,10 +26,9 @@ func (s *Service) applyKVStoreConfig(cfg *config.Config) {
 	_ = kvstore.ConfigureLocal(true, cfg.EffectiveKVStorePath())
 }
 
-func (s *Service) shutdownKVStore() error {
+func (s *Service) shutdownKVStore(ctx context.Context) error {
 	if s == nil {
 		return nil
 	}
-	s.kvStoreManaged.Store(false)
-	return kvstore.ShutdownLocal()
+	return kvstore.ShutdownLocalContext(ctx)
 }

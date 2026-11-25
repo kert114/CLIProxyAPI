@@ -80,7 +80,7 @@ func newIssue6631Harness(t *testing.T) *issue6631Harness {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	watcherWrapper, errWatcher := service.watcherFactory(configPath, authDir, func(newCfg *config.Config) {
-		service.applyWatcherConfigUpdate(newCfg)
+		service.applyWatcherConfigUpdate(t.Context(), newCfg)
 	})
 	if errWatcher != nil {
 		t.Fatal(errWatcher)

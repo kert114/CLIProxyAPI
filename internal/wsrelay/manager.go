@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/shutdown"
 )
 
 // Manager exposes a websocket endpoint that proxies Gemini requests to
@@ -23,7 +24,7 @@ type Manager struct {
 
 	providerFactory func(*http.Request) (string, error)
 	onConnected     func(string)
-	onDisconnected  func(string, error)
+	onDisconnected  func(context.Context, string, error)
 
 	logDebugf func(string, ...any)
 	logInfof  func(string, ...any)
@@ -35,7 +36,7 @@ type Options struct {
 	Path            string
 	ProviderFactory func(*http.Request) (string, error)
 	OnConnected     func(string)
-	OnDisconnected  func(string, error)
+	OnDisconnected  func(context.Context, string, error)
 	LogDebugf       func(string, ...any)
 	LogInfof        func(string, ...any)
 	LogWarnf        func(string, ...any)
@@ -93,21 +94,33 @@ func (m *Manager) Handler() http.Handler {
 }
 
 // Stop gracefully closes all active websocket sessions.
-func (m *Manager) Stop(_ context.Context) error {
-	m.sessMutex.Lock()
-	sessions := make([]*session, 0, len(m.sessions))
-	for _, sess := range m.sessions {
-		sessions = append(sessions, sess)
+func (m *Manager) Stop(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
 	}
+	m.sessMutex.Lock()
+	sessions := m.sessions
 	m.sessions = make(map[string]*session)
 	m.sessMutex.Unlock()
 
+	cause := errors.New("wsrelay: manager stopped")
+	closed := make([]*session, 0, len(sessions))
 	for _, sess := range sessions {
-		if sess != nil {
-			sess.cleanup(errors.New("wsrelay: manager stopped"))
+		if sess != nil && sess.close(cause) {
+			closed = append(closed, sess)
 		}
 	}
-	return nil
+	if m.onDisconnected == nil || len(closed) == 0 {
+		return nil
+	}
+	// Close every socket before notifying callers. A disconnect callback may
+	// need to wait for the auth store or an SDK extension.
+	return shutdown.Run(ctx, func() error {
+		for _, sess := range closed {
+			m.onDisconnected(ctx, sess.provider, cause)
+		}
+		return nil
+	})
 }
 
 // handleWebsocket upgrades the connection and wires the session into the pool.
@@ -188,7 +201,7 @@ func (m *Manager) handleSessionClosed(s *session, cause error) {
 	}
 	m.sessMutex.Unlock()
 	if m.onDisconnected != nil {
-		m.onDisconnected(s.provider, cause)
+		m.onDisconnected(context.Background(), s.provider, cause)
 	}
 }
 

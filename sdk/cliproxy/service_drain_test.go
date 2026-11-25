@@ -21,6 +21,8 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/wsrelay"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executionregistry"
+	log "github.com/sirupsen/logrus"
 )
 
 func TestServiceShutdown_BoundsHomeDrainAndSupervisorWait(t *testing.T) {
@@ -40,7 +42,7 @@ func TestServiceShutdown_BoundsHomeDrainAndSupervisorWait(t *testing.T) {
 			if errAccept != nil {
 				return
 			}
-			go serveHomeShutdownConn(conn, stop)
+			go serveHomeShutdownConn(conn, stop, nil)
 		}
 	}()
 
@@ -83,12 +85,134 @@ func TestServiceShutdown_BoundsHomeDrainAndSupervisorWait(t *testing.T) {
 	}
 }
 
-func serveHomeShutdownConn(conn net.Conn, stop <-chan struct{}) {
+func TestServiceShutdown_InterruptsHomeWriters(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		appLog  bool
+		release bool
+	}{
+		{name: "app_log", appLog: true},
+		{name: "release", release: true},
+		{name: "both", appLog: true, release: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			listener, errListen := net.Listen("tcp", "127.0.0.1:0")
+			if errListen != nil {
+				t.Fatal(errListen)
+			}
+			stop := make(chan struct{})
+			t.Cleanup(func() {
+				close(stop)
+				_ = listener.Close()
+				home.ClearCurrent()
+			})
+			heldWrites := 1
+			if tc.appLog && tc.release {
+				heldWrites = 2
+			}
+			started := make(chan struct{}, heldWrites)
+			closed := make(chan error, heldWrites)
+			go func() {
+				for {
+					conn, errAccept := listener.Accept()
+					if errAccept != nil {
+						return
+					}
+					go serveHomeShutdownConn(conn, stop, func(args []string, reader *bufio.Reader) bool {
+						appLog := len(args) >= 3 && args[1] == "app-log" && strings.Contains(args[2], "shutdown-held-app-log")
+						release := len(args) >= 2 && args[1] == "concurrency-release"
+						if (tc.appLog && appLog) || (tc.release && release) {
+							_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+							started <- struct{}{}
+							_, errRead := reader.ReadByte()
+							closed <- errRead
+							return true
+						}
+						return false
+					})
+				}
+			}()
+
+			service := newRegistryTestService(t, listener)
+			service.startHomeSubscriber(t.Context())
+			supervisor := service.homeSupervisor
+			t.Cleanup(func() {
+				supervisor.cancel()
+				select {
+				case <-supervisor.done:
+				case <-time.After(5 * time.Second):
+					t.Error("Home supervisor did not exit")
+				}
+			})
+			registry := waitForServiceRegistry(t, service, 5*time.Second)
+			pending, errBegin := registry.BeginDispatch()
+			if errBegin != nil {
+				t.Fatal(errBegin)
+			}
+			defer pending.End()
+			if tc.appLog {
+				log.Info("shutdown-held-app-log")
+			}
+			if tc.release {
+				releasePending, errBeginRelease := registry.BeginDispatch()
+				if errBeginRelease != nil {
+					t.Fatal(errBeginRelease)
+				}
+				defer releasePending.End()
+				scope, errInstall := registry.Install(releasePending, executionregistry.ScopeSpec{
+					RequestID: "fixture", CredentialID: "fixture", Model: "fixture", Accounted: true,
+				})
+				if errInstall != nil {
+					t.Fatal(errInstall)
+				}
+				scope.End("fixture complete")
+			}
+			for range heldWrites {
+				select {
+				case <-started:
+				case <-time.After(2 * time.Second):
+					t.Fatal("Home write did not start")
+				}
+			}
+
+			ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+			defer cancel()
+			shutdownDone := make(chan struct{})
+			go func() {
+				defer close(shutdownDone)
+				_ = service.Shutdown(ctx)
+			}()
+			bound := time.After(500 * time.Millisecond)
+			for _, signal := range []struct {
+				name string
+				done <-chan struct{}
+			}{{"Shutdown", shutdownDone}, {"Home supervisor", supervisor.done}} {
+				select {
+				case <-signal.done:
+				case <-bound:
+					t.Fatalf("%s waited past the deadline for the held Home write", signal.name)
+				}
+			}
+			for range heldWrites {
+				select {
+				case errRead := <-closed:
+					if !errors.Is(errRead, io.EOF) && !errors.Is(errRead, syscall.ECONNRESET) {
+						t.Fatalf("Home connection still held: %v", errRead)
+					}
+				case <-bound:
+					t.Fatal("Home write socket stayed open after the deadline")
+				}
+			}
+		})
+	}
+}
+
+func serveHomeShutdownConn(conn net.Conn, stop <-chan struct{}, hold func([]string, *bufio.Reader) bool) {
 	defer func() { _ = conn.Close() }()
 	reader := bufio.NewReader(conn)
 	for {
 		args, errRead := readRegistryTestRedisCommand(reader)
-		if errRead != nil {
+		if errRead != nil || (hold != nil && hold(args, reader)) {
 			return
 		}
 		var reply string
@@ -100,6 +224,8 @@ func serveHomeShutdownConn(conn net.Conn, stop <-chan struct{}) {
 			continue
 		case len(args) >= 2 && strings.EqualFold(args[0], "GET") && args[1] == "plugin-tasks":
 			reply = "$2\r\n[]\r\n"
+		case len(args) >= 2 && strings.EqualFold(args[0], "RPUSH") && args[1] == "app-log":
+			reply = ":1\r\n"
 		case len(args) >= 2 && strings.EqualFold(args[0], "SUBSCRIBE") && args[1] == "config":
 			_, _ = io.WriteString(conn, "*3\r\n$9\r\nsubscribe\r\n$6\r\nconfig\r\n:1\r\n")
 			<-stop
@@ -114,8 +240,10 @@ func serveHomeShutdownConn(conn net.Conn, stop <-chan struct{}) {
 }
 
 func TestServiceShutdown_DrainsRelayBackedStream(t *testing.T) {
+	connected := make(chan struct{})
 	relay := wsrelay.NewManager(wsrelay.Options{
 		ProviderFactory: func(*http.Request) (string, error) { return "fixture", nil },
+		OnConnected:     func(string) { close(connected) },
 	})
 	service, addr, serving := startDrainTestService(t, api.WithEngineConfigurator(func(engine *gin.Engine) {
 		engine.GET(relay.Path(), gin.WrapH(relay.Handler()))
@@ -147,6 +275,11 @@ func TestServiceShutdown_DrainsRelayBackedStream(t *testing.T) {
 		t.Fatal(errDial)
 	}
 	defer func() { _ = peer.Close() }()
+	select {
+	case <-connected:
+	case <-time.After(time.Second):
+		t.Fatal("relay session was not registered")
+	}
 	_ = peer.SetReadDeadline(time.Now().Add(10 * time.Second))
 
 	client := &http.Client{Timeout: 10 * time.Second}
