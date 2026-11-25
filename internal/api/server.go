@@ -28,6 +28,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/managementasset"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/shutdown"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v8/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers/openai"
@@ -48,6 +49,8 @@ type Server struct {
 
 	// muxBaseListener is the shared TCP listener used to serve both HTTP and Redis protocol traffic.
 	listenerMu      sync.Mutex
+	listenerStopped bool
+	connections     shutdown.Connections
 	muxBaseListener net.Listener
 
 	// muxHTTPListener receives HTTP connections selected by the multiplexer.
@@ -304,49 +307,50 @@ func (s *Server) Start() error {
 	}
 
 	addr := s.server.Addr
-	listener, errListen := net.Listen("tcp", addr)
-	if errListen != nil {
-		return fmt.Errorf("failed to start HTTP server: %v", errListen)
-	}
-
 	cfg := s.getConfig()
-	useTLS := cfg != nil && cfg.TLS.Enable
-	if useTLS {
+	var tlsConfig *tls.Config
+	if cfg != nil && cfg.TLS.Enable {
 		certPath := strings.TrimSpace(cfg.TLS.Cert)
 		keyPath := strings.TrimSpace(cfg.TLS.Key)
 		if certPath == "" || keyPath == "" {
-			if errClose := listener.Close(); errClose != nil {
-				log.Errorf("failed to close listener after TLS validation failure: %v", errClose)
-			}
 			return fmt.Errorf("failed to start HTTPS server: tls.cert or tls.key is empty")
 		}
 		certPair, errLoad := tls.LoadX509KeyPair(certPath, keyPath)
 		if errLoad != nil {
-			if errClose := listener.Close(); errClose != nil {
-				log.Errorf("failed to close listener after TLS key pair load failure: %v", errClose)
-			}
 			return fmt.Errorf("failed to start HTTPS server: %v", errLoad)
 		}
-
-		tlsConfig := &tls.Config{
+		tlsConfig = &tls.Config{
 			Certificates: []tls.Certificate{certPair},
 			NextProtos:   []string{"h2", "http/1.1"},
 		}
+	}
+	// Resolve addresses and read certificates before taking the listener lock.
+	// Binding and publication must be atomic with respect to Stop.
+	tcpAddr, errResolve := net.ResolveTCPAddr("tcp", addr)
+	if errResolve != nil {
+		return fmt.Errorf("failed to start HTTP server: %v", errResolve)
+	}
+	s.listenerMu.Lock()
+	if s.listenerStopped {
+		s.listenerMu.Unlock()
+		return nil
+	}
+	listener, errListen := net.ListenTCP("tcp", tcpAddr)
+	if errListen != nil {
+		s.listenerMu.Unlock()
+		return fmt.Errorf("failed to start HTTP server: %v", errListen)
+	}
+	httpListener := newMuxListener(listener.Addr(), 1024)
+	s.muxBaseListener = listener
+	s.muxHTTPListener = httpListener
+	s.listenerMu.Unlock()
+
+	if tlsConfig != nil {
 		s.server.TLSConfig = tlsConfig
 		if errHTTP2 := http2.ConfigureServer(s.server, &http2.Server{}); errHTTP2 != nil {
 			log.Warnf("failed to configure HTTP/2: %v", errHTTP2)
 		}
-		listener = tls.NewListener(listener, tlsConfig)
-		log.Debugf("Starting API server on %s with TLS", addr)
-	} else {
-		log.Debugf("Starting API server on %s", addr)
 	}
-
-	httpListener := newMuxListener(listener.Addr(), 1024)
-	s.listenerMu.Lock()
-	s.muxBaseListener = listener
-	s.muxHTTPListener = httpListener
-	s.listenerMu.Unlock()
 
 	httpErrCh := make(chan error, 1)
 	acceptErrCh := make(chan error, 1)
@@ -355,7 +359,7 @@ func (s *Server) Start() error {
 		httpErrCh <- s.server.Serve(httpListener)
 	}()
 	go func() {
-		acceptErrCh <- s.acceptMuxConnections(listener, httpListener)
+		acceptErrCh <- s.acceptMuxConnectionsWithTLS(listener, httpListener, tlsConfig)
 	}()
 
 	select {
@@ -391,13 +395,13 @@ func (s *Server) Start() error {
 		s.muxHTTPListener = nil
 		s.muxBaseListener = nil
 		s.listenerMu.Unlock()
-		if muxHTTP != nil {
-			_ = muxHTTP.Close()
-		}
 		if muxBase != nil {
 			if errClose := muxBase.Close(); errClose != nil && !errors.Is(errClose, net.ErrClosed) {
 				log.Debugf("failed to close shared listener after accept loop exit: %v", errClose)
 			}
+		}
+		if muxHTTP != nil {
+			_ = muxHTTP.Close()
 		}
 		errServe := <-httpErrCh
 		errServe = normalizeHTTPServeError(errServe)
@@ -438,21 +442,90 @@ func (s *Server) Stop(ctx context.Context) error {
 // StopWithDrainTimeout uses a caller's snapshot of the shutdown timeout so the
 // drain budget matches the service's teardown order even during a config reload.
 func (s *Server) StopWithDrainTimeout(ctx context.Context, drainTimeout int) error {
-	log.Debug("Stopping API server...")
+	if drainTimeout <= 0 {
+		return s.stopLegacy(ctx)
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	drainBudget := time.Duration(min(int64(drainTimeout), math.MaxInt64/int64(time.Second))) * time.Second
+	drainCtx, cancel := context.WithTimeout(ctx, drainBudget)
+	defer cancel()
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < drainBudget {
+		remaining := max(0, time.Until(deadline)).Round(time.Millisecond)
+		go log.WithFields(log.Fields{
+			"shutdown_timeout_seconds": drainTimeout,
+			"remaining":                remaining,
+		}).Warn("HTTP drain limited by shutdown context deadline")
+	}
 
+	muxHTTP, muxBase := s.detachListeners(true)
+	if muxBase != nil {
+		_ = muxBase.Close()
+	}
+	// net/http can wait for a TLS close alert even on an idle connection.
+	// Its shutdown context doesn't interrupt a Close already in progress.
+	interrupted := make(chan struct{})
+	stopInterrupt := context.AfterFunc(drainCtx, func() {
+		s.connections.Close()
+		close(interrupted)
+	})
+	if muxHTTP != nil {
+		_ = muxHTTP.Close()
+	}
+	var errShutdown error
+	if s.server != nil {
+		errShutdown = s.server.Shutdown(drainCtx)
+	}
+	if stopInterrupt() {
+		// Also includes sockets still sniffing and connections transferred
+		// to WebSocket or RESP handlers outside http.Server's ownership.
+		s.connections.Close()
+	} else {
+		<-interrupted
+	}
+	if s.server != nil {
+		if errClose := s.server.Close(); errClose != nil && !errors.Is(errClose, http.ErrServerClosed) && !errors.Is(errClose, net.ErrClosed) && errShutdown == nil {
+			errShutdown = errClose
+		}
+	}
+	if errors.Is(errShutdown, context.DeadlineExceeded) || errors.Is(errShutdown, context.Canceled) {
+		go log.WithError(errShutdown).Warn("HTTP drain ended before all requests finished, closing remaining connections")
+		errShutdown = nil
+	}
+	if s.codexLiveHandler != nil {
+		s.codexLiveHandler.CloseContext(drainCtx)
+	}
+	if errShutdown != nil {
+		return fmt.Errorf("failed to shutdown HTTP server: %w", errShutdown)
+	}
+	return nil
+}
+
+func (s *Server) detachListeners(bounded bool) (*muxListener, net.Listener) {
 	if s.keepAliveEnabled {
 		select {
 		case s.keepAliveStop <- struct{}{}:
 		default:
 		}
 	}
-
 	s.listenerMu.Lock()
-	muxHTTP := s.muxHTTPListener
-	s.muxHTTPListener = nil
-	muxBase := s.muxBaseListener
-	s.muxBaseListener = nil
-	s.listenerMu.Unlock()
+	defer s.listenerMu.Unlock()
+	if bounded {
+		s.listenerStopped = true
+		if s.muxHTTPListener != nil {
+			s.muxHTTPListener.interrupt.Store(true)
+		}
+	}
+	muxHTTP, muxBase := s.muxHTTPListener, s.muxBaseListener
+	s.muxHTTPListener, s.muxBaseListener = nil, nil
+	return muxHTTP, muxBase
+}
+
+func (s *Server) stopLegacy(ctx context.Context) error {
+	log.Debug("Stopping API server...")
+
+	muxHTTP, muxBase := s.detachListeners(false)
 
 	if muxHTTP != nil {
 		_ = muxHTTP.Close()
@@ -463,44 +536,16 @@ func (s *Server) StopWithDrainTimeout(ctx context.Context, drainTimeout int) err
 		}
 	}
 
-	// Close the HTTP server. With a positive server.shutdown-timeout, drain
-	// in-flight requests for up to that many seconds first; otherwise close
-	// immediately without graceful draining.
+	// Close the HTTP server immediately without graceful draining.
 	var errCloseServer error
 	if s.server != nil {
-		if drainTimeout > 0 {
-			// Bound the drain by the configured timeout even when the caller's
-			// context is more generous: shutdown must never hang longer than the
-			// operator chose. A tighter caller deadline still wins via parent ctx.
-			drainBudget := time.Duration(min(int64(drainTimeout), math.MaxInt64/int64(time.Second))) * time.Second
-			drainDeadline := time.Now().Add(drainBudget)
-			if deadline, ok := ctx.Deadline(); ok && deadline.Before(drainDeadline) {
-				log.WithFields(log.Fields{
-					"shutdown_timeout_seconds": drainTimeout,
-					"remaining":                max(0, time.Until(deadline)).Round(time.Millisecond),
-				}).Warn("HTTP drain limited by shutdown context deadline")
-			}
-			drainCtx, cancel := context.WithDeadline(ctx, drainDeadline)
-			defer cancel()
-			log.Debugf("draining HTTP connections for up to %ds", drainTimeout)
-			errShutdown := s.server.Shutdown(drainCtx)
-			switch {
-			case errors.Is(errShutdown, context.DeadlineExceeded), errors.Is(errShutdown, context.Canceled):
-				log.WithError(errShutdown).Warn("HTTP drain ended before all requests finished, closing remaining connections")
-			case errShutdown != nil:
-				errCloseServer = errShutdown
-			}
-		}
-		// Always force-close afterwards: this terminates anything that outlived
-		// the drain budget and is a no-op when Shutdown already returned cleanly.
-		// Hijacked connections (WebSocket sessions) are not tracked by the HTTP
-		// server; they are released by their own managers below.
-		if errClose := s.server.Close(); errClose != nil && !errors.Is(errClose, http.ErrServerClosed) && !errors.Is(errClose, net.ErrClosed) && errCloseServer == nil {
-			errCloseServer = errClose
+		errCloseServer = s.server.Close()
+		if errors.Is(errCloseServer, http.ErrServerClosed) || errors.Is(errCloseServer, net.ErrClosed) {
+			errCloseServer = nil
 		}
 	}
 	if s.codexLiveHandler != nil {
-		s.codexLiveHandler.CloseContext(ctx)
+		s.codexLiveHandler.Close()
 	}
 	if errCloseServer != nil {
 		return fmt.Errorf("failed to shutdown HTTP server: %v", errCloseServer)

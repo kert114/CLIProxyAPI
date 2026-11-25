@@ -3,6 +3,7 @@ package cliproxy
 import (
 	"context"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/pprof"
 	"strings"
@@ -14,11 +15,13 @@ import (
 )
 
 type pprofServer struct {
-	mu      sync.Mutex
-	server  *http.Server
-	addr    string
-	enabled bool
-	owner   uint64
+	mu       sync.Mutex
+	server   *http.Server
+	listener net.Listener
+	addr     string
+	enabled  bool
+	owner    uint64
+	stopped  bool
 }
 
 func newPprofServer() *pprofServer {
@@ -36,17 +39,35 @@ func (s *Service) applyPprofConfigContext(ctx context.Context, cfg *config.Confi
 	if s.applyPprofConfigContextFn != nil {
 		return s.applyPprofConfigContextFn(ctx, cfg)
 	}
+	s.cfgMu.Lock()
+	if s.stopping {
+		s.cfgMu.Unlock()
+		return false
+	}
 	if s.pprofServer == nil {
 		s.pprofServer = newPprofServer()
 	}
-	return s.pprofServer.ApplyContext(ctx, cfg)
+	profiler := s.pprofServer
+	s.cfgMu.Unlock()
+	return profiler.ApplyContext(ctx, cfg)
 }
 
 func (s *Service) shutdownPprof(ctx context.Context) error {
-	if s == nil || s.pprofServer == nil {
+	return s.stopPprof(ctx, true)
+}
+
+func (s *Service) shutdownPprofLegacy(ctx context.Context) error {
+	return s.stopPprof(ctx, false)
+}
+
+func (s *Service) stopPprof(ctx context.Context, bounded bool) error {
+	if s == nil {
 		return nil
 	}
-	return s.pprofServer.Shutdown(ctx)
+	s.cfgMu.RLock()
+	profiler := s.pprofServer
+	s.cfgMu.RUnlock()
+	return profiler.shutdown(ctx, bounded)
 }
 
 func (p *pprofServer) Apply(cfg *config.Config) {
@@ -70,15 +91,22 @@ func (p *pprofServer) ApplyContext(ctx context.Context, cfg *config.Config) bool
 	enabled := cfg.Pprof.Enable
 
 	p.mu.Lock()
+	if p.stopped || ctx.Err() != nil {
+		p.mu.Unlock()
+		return false
+	}
 	p.owner++
 	owner := p.owner
-	currentServer := p.server
+	currentServer, currentListener := p.server, p.listener
 	currentAddr := p.addr
 	p.addr = addr
 	p.enabled = enabled
 	if !enabled {
-		p.server = nil
+		p.server, p.listener = nil, nil
 		p.mu.Unlock()
+		if currentListener != nil {
+			_ = currentListener.Close()
+		}
 		if currentServer != nil {
 			if errStop := p.stopServerWithContext(ctx, currentServer, currentAddr, "disabled"); errStop != nil {
 				return false
@@ -90,9 +118,12 @@ func (p *pprofServer) ApplyContext(ctx context.Context, cfg *config.Config) bool
 		p.mu.Unlock()
 		return ctx.Err() == nil
 	}
-	p.server = nil
+	p.server, p.listener = nil, nil
 	p.mu.Unlock()
 
+	if currentListener != nil {
+		_ = currentListener.Close()
+	}
 	if currentServer != nil {
 		if errStop := p.stopServerWithContext(ctx, currentServer, currentAddr, "restarted"); errStop != nil {
 			return false
@@ -115,42 +146,59 @@ func (p *pprofServer) ApplyContext(ctx context.Context, cfg *config.Config) bool
 }
 
 func (p *pprofServer) Shutdown(ctx context.Context) error {
+	return p.shutdown(ctx, true)
+}
+
+func (p *pprofServer) shutdown(ctx context.Context, bounded bool) error {
 	if p == nil {
 		return nil
 	}
 	p.mu.Lock()
-	currentServer := p.server
+	currentServer, currentListener := p.server, p.listener
 	currentAddr := p.addr
 	p.owner++
-	p.server = nil
+	p.server, p.listener = nil, nil
 	p.enabled = false
+	p.stopped = bounded
 	p.mu.Unlock()
 
+	if currentListener != nil {
+		_ = currentListener.Close()
+	}
 	if currentServer == nil {
 		return nil
 	}
-	return p.stopServerWithContext(ctx, currentServer, currentAddr, "shutdown")
+	return p.stopServerMode(ctx, currentServer, currentAddr, "shutdown", bounded)
 }
 
 func (p *pprofServer) startServer(addr string, owner uint64) *http.Server {
-	mux := newPprofMux()
 	server := &http.Server{
 		Addr:              addr,
-		Handler:           mux,
+		Handler:           newPprofMux(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
-
+	tcpAddr, errResolve := net.ResolveTCPAddr("tcp", addr)
+	if errResolve != nil {
+		log.Errorf("pprof server failed on %s: %v", addr, errResolve)
+		return nil
+	}
 	p.mu.Lock()
 	if !p.enabled || p.addr != addr || p.owner != owner || p.server != nil {
 		p.mu.Unlock()
 		return nil
 	}
-	p.server = server
+	listener, errListen := net.ListenTCP("tcp", tcpAddr)
+	if errListen != nil {
+		p.mu.Unlock()
+		log.Errorf("pprof server failed on %s: %v", addr, errListen)
+		return nil
+	}
+	p.server, p.listener = server, listener
 	p.mu.Unlock()
 
-	log.Infof("pprof server starting on %s", addr)
 	go func() {
-		if errServe := server.ListenAndServe(); errServe != nil && !errors.Is(errServe, http.ErrServerClosed) {
+		log.Infof("pprof server starting on %s", addr)
+		if errServe := server.Serve(listener); errServe != nil && !errors.Is(errServe, http.ErrServerClosed) && !errors.Is(errServe, net.ErrClosed) {
 			log.Errorf("pprof server failed on %s: %v", addr, errServe)
 			p.clearFailedServer(server)
 		}
@@ -166,7 +214,7 @@ func (p *pprofServer) clearFailedServer(server *http.Server) {
 	}
 	p.mu.Lock()
 	if p.server == server {
-		p.server = nil
+		p.server, p.listener = nil, nil
 	}
 	p.mu.Unlock()
 }
@@ -184,12 +232,20 @@ func (p *pprofServer) stopOwnedServerWithContext(ctx context.Context, server *ht
 		p.mu.Unlock()
 		return nil
 	}
-	p.server = nil
+	listener := p.listener
+	p.server, p.listener = nil, nil
 	p.mu.Unlock()
+	if listener != nil {
+		_ = listener.Close()
+	}
 	return p.stopServerWithContext(ctx, server, addr, reason)
 }
 
 func (p *pprofServer) stopServerWithContext(ctx context.Context, server *http.Server, addr string, reason string) error {
+	return p.stopServerMode(ctx, server, addr, reason, true)
+}
+
+func (p *pprofServer) stopServerMode(ctx context.Context, server *http.Server, addr string, reason string, bounded bool) error {
 	if server == nil {
 		return nil
 	}
@@ -199,14 +255,22 @@ func (p *pprofServer) stopServerWithContext(ctx context.Context, server *http.Se
 	}
 	stopCtx, cancel := context.WithTimeout(stopCtx, 5*time.Second)
 	defer cancel()
-	if errStop := server.Shutdown(stopCtx); errStop != nil {
-		if errClose := server.Close(); errClose != nil && !errors.Is(errClose, http.ErrServerClosed) {
-			errStop = errors.Join(errStop, errClose)
+	if errStop := server.Shutdown(stopCtx); errStop != nil && !errors.Is(errStop, net.ErrClosed) {
+		if bounded {
+			if errClose := server.Close(); errClose != nil && !errors.Is(errClose, http.ErrServerClosed) {
+				errStop = errors.Join(errStop, errClose)
+			}
+			go log.Errorf("pprof server stop failed on %s: %v", addr, errStop)
+		} else {
+			log.Errorf("pprof server stop failed on %s: %v", addr, errStop)
 		}
-		log.Errorf("pprof server stop failed on %s: %v", addr, errStop)
 		return errStop
 	}
-	log.Infof("pprof server stopped on %s (%s)", addr, reason)
+	if bounded {
+		go log.Infof("pprof server stopped on %s (%s)", addr, reason)
+	} else {
+		log.Infof("pprof server stopped on %s (%s)", addr, reason)
+	}
 	return nil
 }
 

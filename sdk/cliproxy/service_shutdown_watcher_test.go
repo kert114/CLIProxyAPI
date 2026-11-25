@@ -10,7 +10,7 @@ import (
 )
 
 func TestServiceRun_CancelsInFlightWatcherReload(t *testing.T) {
-	cfg := &config.Config{Host: "127.0.0.1", AuthDir: t.TempDir()}
+	cfg := &config.Config{Host: "127.0.0.1", AuthDir: t.TempDir(), ShutdownTimeoutSeconds: 1}
 	cfg.KVStore.Disabled = true
 	service, err := NewBuilder().WithConfig(cfg).
 		WithConfigPath(filepath.Join(cfg.AuthDir, "fixture.yaml")).

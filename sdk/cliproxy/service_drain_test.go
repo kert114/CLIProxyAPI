@@ -47,6 +47,7 @@ func TestServiceShutdown_BoundsHomeDrainAndSupervisorWait(t *testing.T) {
 	}()
 
 	service := newRegistryTestService(t, listener)
+	service.cfg.ShutdownTimeoutSeconds = 1
 	service.startHomeSubscriber(t.Context())
 	supervisor := service.homeSupervisor
 	t.Cleanup(func() {
@@ -134,6 +135,7 @@ func TestServiceShutdown_InterruptsHomeWriters(t *testing.T) {
 			}()
 
 			service := newRegistryTestService(t, listener)
+			service.cfg.ShutdownTimeoutSeconds = 1
 			service.startHomeSubscriber(t.Context())
 			supervisor := service.homeSupervisor
 			t.Cleanup(func() {
@@ -220,7 +222,7 @@ func serveHomeShutdownConn(conn net.Conn, stop <-chan struct{}, hold func([]stri
 		case len(args) > 0 && strings.EqualFold(args[0], "HELLO"):
 			reply = "%6\r\n$6\r\nserver\r\n$5\r\nredis\r\n$5\r\nproto\r\n:3\r\n$2\r\nid\r\n:1\r\n$4\r\nmode\r\n$10\r\nstandalone\r\n$4\r\nrole\r\n$6\r\nmaster\r\n$7\r\nmodules\r\n*0\r\n"
 		case len(args) >= 2 && strings.EqualFold(args[0], "GET") && args[1] == "config":
-			writeRegistryTestConfig(conn, "credential-concurrency:\n  lifecycle-config-revision: 1\n  cpa-cancel-bound: 3s\n")
+			writeRegistryTestConfig(conn, "server:\n  shutdown-timeout: 1\ncredential-concurrency:\n  lifecycle-config-revision: 1\n  cpa-cancel-bound: 3s\n")
 			continue
 		case len(args) >= 2 && strings.EqualFold(args[0], "GET") && args[1] == "plugin-tasks":
 			reply = "$2\r\n[]\r\n"
@@ -336,6 +338,10 @@ func TestServiceShutdown_DrainsRelayBackedStream(t *testing.T) {
 }
 
 func startDrainTestService(t *testing.T, options ...api.ServerOption) (*Service, string, <-chan error) {
+	return startDrainTestServiceWithTimeout(t, 5, options...)
+}
+
+func startDrainTestServiceWithTimeout(t *testing.T, timeout int, options ...api.ServerOption) (*Service, string, <-chan error) {
 	t.Helper()
 	listener, errListen := net.Listen("tcp", "127.0.0.1:0")
 	if errListen != nil {
@@ -346,7 +352,7 @@ func startDrainTestService(t *testing.T, options ...api.ServerOption) (*Service,
 		Host:                   "127.0.0.1",
 		Port:                   listener.Addr().(*net.TCPAddr).Port,
 		AuthDir:                t.TempDir(),
-		ShutdownTimeoutSeconds: 5,
+		ShutdownTimeoutSeconds: timeout,
 	}
 	if errClose := listener.Close(); errClose != nil {
 		t.Fatal(errClose)
@@ -432,5 +438,53 @@ func TestServiceShutdown_ClosesProxyListenerBeforeWaitingForProfile(t *testing.T
 	release()
 	if errStop := <-shutdown; errStop != nil {
 		t.Fatal(errStop)
+	}
+}
+
+func TestServiceShutdown_ZeroTimeoutKeepsAPIUntilPprofGraceEnds(t *testing.T) {
+	service, addr, _ := startDrainTestServiceWithTimeout(t, 0)
+	active, release := make(chan struct{}), make(chan struct{})
+	profile := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(active)
+		<-release
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer profile.Close()
+	finish := sync.OnceFunc(func() { close(release) })
+	defer finish()
+	stopping := make(chan struct{})
+	profile.Config.RegisterOnShutdown(func() { close(stopping) })
+	service.pprofServer = &pprofServer{server: profile.Config, addr: profile.Listener.Addr().String()}
+	go func() {
+		if resp, err := profile.Client().Get(profile.URL); err == nil {
+			_ = resp.Body.Close()
+		}
+	}()
+	select {
+	case <-active:
+	case <-time.After(time.Second):
+		t.Fatal("profiling request did not start")
+	}
+
+	stopped := make(chan error, 1)
+	go func() { stopped <- service.Shutdown(context.Background()) }()
+	select {
+	case <-stopping:
+	case <-time.After(time.Second):
+		t.Fatal("pprof shutdown did not start")
+	}
+	client := &http.Client{Timeout: time.Second}
+	res, err := client.Get("http://" + addr + "/healthz")
+	if err != nil {
+		t.Errorf("health check while pprof drained: %v", err)
+	} else {
+		_ = res.Body.Close()
+		if res.StatusCode != http.StatusOK {
+			t.Errorf("health check while pprof drained: %s", res.Status)
+		}
+	}
+	finish()
+	if err := <-stopped; err != nil {
+		t.Fatal(err)
 	}
 }

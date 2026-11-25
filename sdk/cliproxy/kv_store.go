@@ -10,25 +10,34 @@ import (
 )
 
 func (s *Service) applyKVStoreConfig(cfg *config.Config) {
+	s.applyKVStoreConfigContext(context.Background(), cfg)
+}
+
+func (s *Service) applyKVStoreConfigContext(ctx context.Context, cfg *config.Config) {
 	if s == nil {
 		if errShutdown := kvstore.ShutdownLocal(); errShutdown != nil {
 			log.Errorf("failed to shutdown local kv store: %v", errShutdown)
 		}
 		return
 	}
-	s.kvStoreManaged.Store(true)
-	if cfg == nil || cfg.Home.Enabled || home.Current() != nil || cfg.KVStore.Disabled {
-		if errShutdown := kvstore.ShutdownLocal(); errShutdown != nil {
-			log.Errorf("failed to shutdown local kv store: %v", errShutdown)
-		}
+	s.cfgMu.RLock()
+	if s.stopping {
+		s.cfgMu.RUnlock()
 		return
 	}
-	_ = kvstore.ConfigureLocal(true, cfg.EffectiveKVStorePath())
+	s.kvStoreManaged.Store(true)
+	s.cfgMu.RUnlock()
+	enabled := cfg != nil && !cfg.Home.Enabled && home.Current() == nil && !cfg.KVStore.Disabled
+	var path string
+	if enabled {
+		path = cfg.EffectiveKVStorePath()
+	}
+	_ = kvstore.ConfigureLocalContext(ctx, s.proxyPoolPublisher, enabled, path)
 }
 
 func (s *Service) shutdownKVStore(ctx context.Context) error {
 	if s == nil {
 		return nil
 	}
-	return kvstore.ShutdownLocalContext(ctx)
+	return kvstore.ShutdownLocalOwnedContext(ctx, s.proxyPoolPublisher)
 }

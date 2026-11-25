@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/wsrelay"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
@@ -51,7 +52,7 @@ func TestServiceShutdown_DeadlineBoundsComponentStops(t *testing.T) {
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			service := &Service{}
+			service := &Service{cfg: &config.Config{ShutdownTimeoutSeconds: 1}}
 			entered, release, exited := make(chan struct{}), make(chan struct{}), make(chan struct{})
 			tc.install(service, func() {
 				close(entered)
@@ -86,7 +87,7 @@ func TestServiceShutdown_DeadlineBoundsComponentStops(t *testing.T) {
 }
 
 func TestServiceShutdown_DeadlineBoundsConcurrentCaller(t *testing.T) {
-	service := &Service{}
+	service := &Service{cfg: &config.Config{ShutdownTimeoutSeconds: 1}}
 	entered, release, first := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	service.setWatcher(&WatcherWrapper{stop: func() error {
 		close(entered)
@@ -128,7 +129,7 @@ func TestServiceShutdown_DeadlineBoundsLifecycleLocks(t *testing.T) {
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			service := &Service{}
+			service := &Service{cfg: &config.Config{ShutdownTimeoutSeconds: 1}}
 			unlock := tc.hold(service)
 			done := make(chan struct{})
 			defer func() { unlock(); <-done }()
@@ -161,7 +162,7 @@ func TestServiceShutdown_DetachesPprofConnectionAtDeadline(t *testing.T) {
 	})}
 	defer func() { _ = pprof.Close() }()
 	go func() { _ = pprof.Serve(listener) }()
-	service := &Service{pprofServer: &pprofServer{server: pprof}}
+	service := &Service{cfg: &config.Config{ShutdownTimeoutSeconds: 1}, pprofServer: &pprofServer{server: pprof}}
 	client := &http.Client{Timeout: 2 * time.Second}
 	resp, errGet := client.Get("http://" + listener.Addr().String())
 	if errGet != nil {
@@ -209,7 +210,7 @@ func TestServiceShutdown_ClosesRelayWithBlockedDisconnect(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("relay session was not registered")
 	}
-	service := &Service{wsGateway: relay}
+	service := &Service{cfg: &config.Config{ShutdownTimeoutSeconds: 1}, wsGateway: relay}
 	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 	defer cancel()
 	done := make(chan struct{})
@@ -255,7 +256,7 @@ func TestServiceShutdown_DeadlineBoundsDetachedRegistryClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { close(release); scope.End("fixture complete") }()
-	service := &Service{homeRegistry: registry}
+	service := &Service{cfg: &config.Config{ShutdownTimeoutSeconds: 1}, homeRegistry: registry}
 	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 	defer cancel()
 	closed := make(chan struct{})

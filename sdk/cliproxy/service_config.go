@@ -166,6 +166,10 @@ func (s *Service) commitConfigUpdate(newCfg *config.Config) configCommit {
 	newCfg = newCfg.CloneForRuntime()
 	helps.AdvanceProxyPoolGeneration(s.proxyPoolPublisher, newCfg)
 	s.cfgMu.Lock()
+	if s.stopping {
+		s.cfgMu.Unlock()
+		return configCommit{}
+	}
 	s.cfg = newCfg
 	s.cfgMu.Unlock()
 	s.cancelStaleAntigravityProbes("")
@@ -212,7 +216,7 @@ func (s *Service) applyConfigRuntime(ctx context.Context, commit configCommit, s
 	}
 	s.applyDiscoveryConfigContext(ctx, cfg)
 	if s.kvStoreManaged.Load() {
-		s.applyKVStoreConfig(cfg)
+		s.applyKVStoreConfigContext(ctx, cfg)
 	}
 	if errContext := ctx.Err(); errContext != nil {
 		return false

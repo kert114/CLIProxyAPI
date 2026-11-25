@@ -29,8 +29,10 @@ type TransportCache[K comparable] struct {
 	mu       sync.Mutex
 	capacity int
 	// order keeps the most recently used entry at the front.
-	order *list.List
-	items map[K]*list.Element
+	order        *list.List
+	items        map[K]*list.Element
+	prepare      func(K, *http.Transport)
+	closeEvicted func(*http.Transport)
 }
 
 type transportCacheEntry[K comparable] struct {
@@ -140,6 +142,9 @@ func (c *TransportCache[K]) Get(key K, build func() (*http.Transport, error)) (*
 	}
 
 	entry := &transportCacheEntry[K]{key: key, transport: transport}
+	if c.prepare != nil {
+		c.prepare(key, transport)
+	}
 	attachTransportRetirementGuard(transport, &entry.retired)
 	c.items[key] = c.order.PushFront(entry)
 	evicted := c.evictLocked()
@@ -147,7 +152,11 @@ func (c *TransportCache[K]) Get(key K, build func() (*http.Transport, error)) (*
 	c.mu.Unlock()
 
 	for _, t := range evicted {
-		t.CloseIdleConnections()
+		if c.closeEvicted != nil {
+			c.closeEvicted(t)
+		} else {
+			t.CloseIdleConnections()
+		}
 	}
 	return transport, nil
 }

@@ -206,6 +206,12 @@ func (s *sessionStore) closeAllContext(ctx context.Context, reason string) {
 	if len(entries) == 0 {
 		return
 	}
+	if ctx.Done() == nil {
+		for _, entry := range entries {
+			endLiveSession(entry.session, reason)
+		}
+		return
+	}
 	_ = shutdown.Run(ctx, func() error {
 		var workers sync.WaitGroup
 		for _, entry := range entries {

@@ -216,14 +216,16 @@ func (pr *pendingRequest) close() {
 }
 
 type session struct {
-	conn       *websocket.Conn
-	manager    *Manager
-	provider   string
-	id         string
-	closed     chan struct{}
-	closeOnce  sync.Once
-	writeMutex sync.Mutex
-	pending    sync.Map // map[string]*pendingRequest
+	conn           *websocket.Conn
+	manager        *Manager
+	provider       string
+	id             string
+	closed         chan struct{}
+	lifetime       chan struct{}
+	invalidateOnce sync.Once
+	closeOnce      sync.Once
+	writeMutex     sync.Mutex
+	pending        sync.Map // map[string]*pendingRequest
 }
 
 func newSession(conn *websocket.Conn, mgr *Manager, id string) *session {
@@ -232,6 +234,7 @@ func newSession(conn *websocket.Conn, mgr *Manager, id string) *session {
 		manager:  mgr,
 		provider: "",
 		id:       id,
+		lifetime: make(chan struct{}),
 		closed:   make(chan struct{}),
 	}
 	conn.SetReadLimit(maxInboundMessageLen)

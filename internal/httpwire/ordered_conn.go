@@ -38,6 +38,8 @@ type orderedRequestConn struct {
 	chunked       *chunkedRequestTracker
 }
 
+func (c *orderedRequestConn) NetConn() net.Conn { return c.Conn }
+
 func (c *orderedRequestConn) Write(p []byte) (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

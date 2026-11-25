@@ -80,8 +80,9 @@ type Service struct {
 	// kvStoreManaged tracks whether this service instance owns local KVStore lifecycle.
 	kvStoreManaged atomic.Bool
 
-	// serverErr channel for server startup/shutdown errors.
-	serverErr chan error
+	// Positive shutdown fences startup publication under cfgMu.
+	stopping      bool
+	cancelStartup context.CancelFunc
 
 	// watcher handles file system monitoring.
 	watcher *WatcherWrapper

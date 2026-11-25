@@ -141,6 +141,12 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	if errPersist := m.persistLocked(ctx, auth); errPersist != nil {
 		log.WithFields(log.Fields{"auth_id": auth.ID, "credential": auth.ID, "provider": auth.Provider}).Warnf("failed to persist registered auth %s (%s): %v", auth.Provider, auth.ID, errPersist)
 	}
+	select {
+	case <-auth.RuntimeLifetime:
+		m.mu.Unlock()
+		return nil, context.Canceled
+	default:
+	}
 	if m.authEpochs[auth.ID] != auth.RegistrationEpoch {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("auth %s changed registration during persistence", auth.ID)
@@ -318,6 +324,13 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 	if !ok || existing == nil {
 		m.mu.Unlock()
 		return nil, false, false, nil
+	}
+	auth.RuntimeLifetime = existing.RuntimeLifetime
+	select {
+	case <-auth.RuntimeLifetime:
+		m.mu.Unlock()
+		return nil, false, false, context.Canceled
+	default:
 	}
 	if m.authEpochs == nil {
 		m.authEpochs = make(map[string]uint64)

@@ -395,6 +395,15 @@ func SetPluginHooks(hooks PluginHooks) {
 	defaultRegistry.SetPluginHooks(hooks)
 }
 
+// ClearPluginHooks removes hooks only if they are still installed.
+func ClearPluginHooks(hooks PluginHooks) {
+	defaultRegistry.mu.Lock()
+	defer defaultRegistry.mu.Unlock()
+	if defaultRegistry.hooks == hooks {
+		defaultRegistry.hooks = nil
+	}
+}
+
 // HasPluginHooks reports whether hooks are installed on the default registry.
 func HasPluginHooks() bool {
 	return defaultRegistry.HasPluginHooks()

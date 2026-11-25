@@ -300,6 +300,18 @@ func (m *discoveryAdvertiserManager) shutdown(ctx context.Context) error {
 	m.generation++
 	m.mu.Unlock()
 
+	if ctx.Done() == nil {
+		if activeStart != nil {
+			activeStart.cancel()
+			<-activeStart.done
+		}
+		m.stopRefresh(refreshStop)
+		if oldAdv != nil {
+			return oldAdv.Stop()
+		}
+		return nil
+	}
+
 	if activeStart != nil {
 		activeStart.cancel()
 	}

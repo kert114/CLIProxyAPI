@@ -14,6 +14,7 @@ import (
 var (
 	controllerMu    sync.RWMutex
 	localGeneration atomic.Uint64
+	localOwner      uint64
 	homeProvider    func() (KVClient, bool, error)
 	localEnabled    bool
 	localStore      *BoltStore
@@ -31,8 +32,18 @@ func RegisterHomeProvider(fn func() (KVClient, bool, error)) {
 
 // ConfigureLocal enables, reconfigures, or disables the local bbolt-backed KV store.
 func ConfigureLocal(enabled bool, rawPath string) error {
+	return ConfigureLocalContext(context.Background(), 0, enabled, rawPath)
+}
+
+// ConfigureLocalContext applies configuration for one SDK owner. A canceled
+// startup must not acquire or replace the store after shutdown.
+func ConfigureLocalContext(ctx context.Context, owner uint64, enabled bool, rawPath string) error {
 	controllerMu.Lock()
 	defer controllerMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	localOwner = owner
 	localGeneration.Add(1)
 
 	if !enabled {
@@ -92,12 +103,17 @@ func ShutdownLocal() error {
 // ShutdownLocalContext stops waiting when ctx expires. bbolt still owns the
 // open database until transactions finish, so the close continues in background.
 func ShutdownLocalContext(ctx context.Context) error {
+	return ShutdownLocalOwnedContext(ctx, 0)
+}
+
+// ShutdownLocalOwnedContext closes only the store owned by this SDK service.
+func ShutdownLocalOwnedContext(ctx context.Context, owner uint64) error {
 	generation := localGeneration.Load()
 	return shutdown.Run(ctx, func() error {
 		controllerMu.Lock()
 		defer controllerMu.Unlock()
 		// A config applied while the caller was waiting owns its store.
-		if localGeneration.Load() != generation {
+		if localGeneration.Load() != generation || (owner != 0 && localOwner != owner) {
 			return nil
 		}
 		return shutdownLocalLocked()

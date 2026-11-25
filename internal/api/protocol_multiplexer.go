@@ -75,6 +75,10 @@ func waitAcceptRetry(httpListener *muxListener, delay time.Duration) bool {
 }
 
 func (s *Server) acceptMuxConnections(listener net.Listener, httpListener *muxListener) error {
+	return s.acceptMuxConnectionsWithTLS(listener, httpListener, nil)
+}
+
+func (s *Server) acceptMuxConnectionsWithTLS(listener net.Listener, httpListener *muxListener, tlsConfig *tls.Config) error {
 	if s == nil || listener == nil {
 		return net.ErrClosed
 	}
@@ -110,6 +114,17 @@ func (s *Server) acceptMuxConnections(listener net.Listener, httpListener *muxLi
 		if httpListener != nil && httpListener.isClosed() {
 			_ = conn.Close()
 			return net.ErrClosed
+		}
+
+		if httpListener != nil {
+			tracked, errTrack := s.connections.Track(conn)
+			if errTrack != nil {
+				return errTrack
+			}
+			conn = tracked
+		}
+		if tlsConfig != nil {
+			conn = tls.Server(conn, tlsConfig)
 		}
 
 		// Dispatch each connection to a goroutine so that slow/idle clients

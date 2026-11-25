@@ -69,11 +69,19 @@ func (s *Service) RegisterUsagePlugin(plugin usage.Plugin) {
 }
 
 func (s *Service) registerPluginAuthParser() {
+	if s == nil {
+		sdkAuth.RegisterPluginAuthParser(nil)
+		return
+	}
 	var parser PluginAuthParser
-	if s != nil && s.pluginHost != nil {
+	if s.pluginHost != nil {
 		parser = s.pluginHost
 	}
-	sdkAuth.RegisterPluginAuthParser(parser)
+	s.cfgMu.RLock()
+	if !s.stopping {
+		sdkAuth.RegisterPluginAuthParser(parser)
+	}
+	s.cfgMu.RUnlock()
 	if watcher := s.currentWatcher(); watcher != nil {
 		watcher.SetPluginAuthParser(parser)
 	}
@@ -130,7 +138,11 @@ func (s *Service) syncPluginRuntimeConfigForConfig(ctx context.Context, cfg *con
 		s.accessManager.SetProviders(sdkaccess.RegisteredProviders())
 	}
 	s.pluginHost.RegisterUsagePlugins()
-	sdktranslator.SetPluginHooks(s.pluginHost)
+	s.cfgMu.RLock()
+	if !s.stopping {
+		sdktranslator.SetPluginHooks(s.pluginHost)
+	}
+	s.cfgMu.RUnlock()
 	if s.server != nil {
 		s.server.RefreshPluginManagementRoutes()
 	}
@@ -347,12 +359,17 @@ func modelRegistrationMaxWorkersForCategory(category string) int {
 }
 
 func (s *Service) registerModelRefreshCallback() {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	if s.stopping {
+		return
+	}
 	// Register callback for startup and periodic model catalog refresh.
 	// When remote model definitions change, re-register models for affected providers.
 	// This intentionally rebuilds per-auth model availability from the latest catalog
 	// snapshot instead of preserving prior registry suppression state.
 	registry.SetModelRefreshCallback(func(changedProviders []string) {
-		if s == nil || s.coreManager == nil || len(changedProviders) == 0 {
+		if s.startupStopped() || s.coreManager == nil || len(changedProviders) == 0 {
 			return
 		}
 

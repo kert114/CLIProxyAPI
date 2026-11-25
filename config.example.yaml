@@ -62,8 +62,10 @@ server:
   # remaining connections are forcibly closed. The CLI starts a 30-second cleanup
   # deadline at shutdown. If less time remains than requested, the server logs a
   # warning and uses the remaining time for the HTTP drain.
-  # Default 0 keeps the legacy behavior: close immediately without draining.
-  # Connection managers handle hijacked connections such as WebSocket sessions separately.
+  # Default 0 preserves the legacy shutdown order and closes HTTP without a drain.
+  # With a positive timeout, the API stops accepting connections before draining and
+  # closes upgrades, RESP connections, and sockets still undergoing protocol detection
+  # when the HTTP drain ends.
   shutdown-timeout: 0
 
   # TLS settings for HTTPS. When enabled, the server listens with the provided certificate and key.

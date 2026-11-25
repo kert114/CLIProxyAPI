@@ -21,25 +21,32 @@ type Manager struct {
 	upgrader  websocket.Upgrader
 	sessions  map[string]*session
 	sessMutex sync.RWMutex
+	stopped   bool
 
-	providerFactory func(*http.Request) (string, error)
-	onConnected     func(string)
-	onDisconnected  func(context.Context, string, error)
+	providerFactory    func(*http.Request) (string, error)
+	onConnected        func(string)
+	onSessionConnected func(string, <-chan struct{})
+	onInvalidated      func(string, <-chan struct{})
+	onDisconnected     func(context.Context, string, error)
 
-	logDebugf func(string, ...any)
-	logInfof  func(string, ...any)
-	logWarnf  func(string, ...any)
+	shouldInvalidate func() bool
+	logDebugf        func(string, ...any)
+	logInfof         func(string, ...any)
+	logWarnf         func(string, ...any)
 }
 
 // Options configures a Manager instance.
 type Options struct {
-	Path            string
-	ProviderFactory func(*http.Request) (string, error)
-	OnConnected     func(string)
-	OnDisconnected  func(context.Context, string, error)
-	LogDebugf       func(string, ...any)
-	LogInfof        func(string, ...any)
-	LogWarnf        func(string, ...any)
+	Path               string
+	ProviderFactory    func(*http.Request) (string, error)
+	OnConnected        func(string)
+	OnSessionConnected func(string, <-chan struct{})
+	OnInvalidated      func(string, <-chan struct{})
+	OnDisconnected     func(context.Context, string, error)
+	ShouldInvalidate   func() bool
+	LogDebugf          func(string, ...any)
+	LogInfof           func(string, ...any)
+	LogWarnf           func(string, ...any)
 }
 
 // NewManager builds a websocket relay manager with the supplied options.
@@ -61,12 +68,15 @@ func NewManager(opts Options) *Manager {
 				return true
 			},
 		},
-		providerFactory: opts.ProviderFactory,
-		onConnected:     opts.OnConnected,
-		onDisconnected:  opts.OnDisconnected,
-		logDebugf:       opts.LogDebugf,
-		logInfof:        opts.LogInfof,
-		logWarnf:        opts.LogWarnf,
+		providerFactory:    opts.ProviderFactory,
+		onConnected:        opts.OnConnected,
+		onSessionConnected: opts.OnSessionConnected,
+		onInvalidated:      opts.OnInvalidated,
+		shouldInvalidate:   opts.ShouldInvalidate,
+		onDisconnected:     opts.OnDisconnected,
+		logDebugf:          opts.LogDebugf,
+		logInfof:           opts.LogInfof,
+		logWarnf:           opts.LogWarnf,
 	}
 	if mgr.logDebugf == nil {
 		mgr.logDebugf = func(string, ...any) {}
@@ -95,10 +105,36 @@ func (m *Manager) Handler() http.Handler {
 
 // Stop gracefully closes all active websocket sessions.
 func (m *Manager) Stop(ctx context.Context) error {
+	return m.stop(ctx, false)
+}
+
+// Shutdown permanently ends the relay's lifetime.
+func (m *Manager) Shutdown(ctx context.Context) error {
+	return m.stop(ctx, true)
+}
+
+// StopLegacy preserves the synchronous disconnect ordering for immediate shutdown.
+func (m *Manager) StopLegacy() error {
+	m.sessMutex.Lock()
+	sessions := m.sessions
+	m.sessions = make(map[string]*session)
+	m.sessMutex.Unlock()
+	for _, sess := range sessions {
+		if sess != nil {
+			sess.cleanup(errors.New("wsrelay: manager stopped"))
+		}
+	}
+	return nil
+}
+
+func (m *Manager) stop(ctx context.Context, permanent bool) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	m.sessMutex.Lock()
+	if permanent {
+		m.stopped = true
+	}
 	sessions := m.sessions
 	m.sessions = make(map[string]*session)
 	m.sessMutex.Unlock()
@@ -106,7 +142,18 @@ func (m *Manager) Stop(ctx context.Context) error {
 	cause := errors.New("wsrelay: manager stopped")
 	closed := make([]*session, 0, len(sessions))
 	for _, sess := range sessions {
-		if sess != nil && sess.close(cause) {
+		if sess != nil {
+			m.invalidateSession(sess)
+			if sess.conn != nil {
+				_ = shutdown.CloseTransport(sess.conn.UnderlyingConn())
+			}
+		}
+	}
+	for _, sess := range sessions {
+		if sess == nil {
+			continue
+		}
+		if sess.close(cause) {
 			closed = append(closed, sess)
 		}
 	}
@@ -155,6 +202,11 @@ func (m *Manager) handleWebsocket(w http.ResponseWriter, r *http.Request) {
 		s.provider = strings.ToLower(s.id)
 	}
 	m.sessMutex.Lock()
+	if m.stopped {
+		m.sessMutex.Unlock()
+		_ = shutdown.CloseTransport(conn.UnderlyingConn())
+		return
+	}
 	var replaced *session
 	if existing, ok := m.sessions[s.provider]; ok {
 		replaced = existing
@@ -164,6 +216,9 @@ func (m *Manager) handleWebsocket(w http.ResponseWriter, r *http.Request) {
 
 	if replaced != nil {
 		replaced.cleanup(errors.New("replaced by new connection"))
+	}
+	if m.onSessionConnected != nil {
+		m.onSessionConnected(s.provider, s.lifetime)
 	}
 	if m.onConnected != nil {
 		m.onConnected(s.provider)
@@ -197,12 +252,24 @@ func (m *Manager) handleSessionClosed(s *session, cause error) {
 	key := strings.ToLower(strings.TrimSpace(s.provider))
 	m.sessMutex.Lock()
 	if cur, ok := m.sessions[key]; ok && cur == s {
+		if m.shouldInvalidate != nil && m.shouldInvalidate() {
+			m.invalidateSession(s)
+		}
 		delete(m.sessions, key)
 	}
 	m.sessMutex.Unlock()
 	if m.onDisconnected != nil {
 		m.onDisconnected(context.Background(), s.provider, cause)
 	}
+}
+
+func (m *Manager) invalidateSession(s *session) {
+	s.invalidateOnce.Do(func() {
+		close(s.lifetime)
+		if m.onInvalidated != nil {
+			go m.onInvalidated(s.provider, s.lifetime)
+		}
+	})
 }
 
 func randomProviderName() string {

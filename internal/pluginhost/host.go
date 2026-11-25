@@ -85,7 +85,8 @@ type Host struct {
 	pluginModelRegistrations map[string][]pluginModelRegistration
 	providerModels           map[string][]*registryModelInfo
 	executorProviders        map[string]struct{}
-	accessProviderKeys       map[string]struct{}
+	frontendAuthMu           sync.Mutex
+	sharedRuntimeRetired     atomic.Bool
 	commandLineFlags         map[string]commandLineFlagRecord
 	commandLineHits          map[string]struct{}
 	managementRoutes         map[string]managementRouteRecord
@@ -127,7 +128,6 @@ func New() *Host {
 		pluginModelRegistrations: make(map[string][]pluginModelRegistration),
 		providerModels:           make(map[string][]*registryModelInfo),
 		executorProviders:        make(map[string]struct{}),
-		accessProviderKeys:       make(map[string]struct{}),
 		commandLineFlags:         make(map[string]commandLineFlagRecord),
 		commandLineHits:          make(map[string]struct{}),
 		managementRoutes:         make(map[string]managementRouteRecord),

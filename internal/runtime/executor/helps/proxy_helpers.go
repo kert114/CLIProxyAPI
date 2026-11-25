@@ -3,6 +3,7 @@ package helps
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"fmt"
 	"net"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/shutdown"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/httptransport"
@@ -138,7 +140,56 @@ const (
 	proxyPoolCapacity = 512
 )
 
-var proxyTransportCache = NewTransportCache[proxyPoolKey](proxyPoolCapacity)
+var proxyTransportCache = newProxyTransportCache()
+
+func newProxyTransportCache() *TransportCache[proxyPoolKey] {
+	cache := NewTransportCache[proxyPoolKey](proxyPoolCapacity)
+	cache.prepare = func(key proxyPoolKey, t *http.Transport) {
+		if value, ok := proxyPoolConnections.Load(key.publisher); ok {
+			trackProxyTransport(t, value.(*shutdown.Connections))
+		}
+	}
+	// A lookup may be holding the publisher generation read lock. Never keep
+	// that lock across an evicted transport's TLS close or idle-pool lock.
+	cache.closeEvicted = func(t *http.Transport) { go t.CloseIdleConnections() }
+	return cache
+}
+
+var proxyPoolConnections sync.Map // publisher identity -> *shutdown.Connections
+
+func trackProxyTransport(t *http.Transport, connections *shutdown.Connections) {
+	track := func(dial func(context.Context, string, string) (net.Conn, error)) func(context.Context, string, string) (net.Conn, error) {
+		return func(ctx context.Context, network, addr string) (net.Conn, error) {
+			conn, err := dial(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			if secure, ok := conn.(*tls.Conn); ok {
+				return connections.TrackTLS(secure)
+			}
+			return connections.Track(conn)
+		}
+	}
+	switch {
+	case t.DialContext != nil:
+		t.DialContext = track(t.DialContext)
+	case t.Dial != nil:
+		dial := t.Dial
+		t.DialContext = track(func(_ context.Context, network, addr string) (net.Conn, error) {
+			return dial(network, addr)
+		})
+	default:
+		t.DialContext = track((&net.Dialer{}).DialContext)
+	}
+	if t.DialTLSContext != nil {
+		t.DialTLSContext = track(t.DialTLSContext)
+	} else if t.DialTLS != nil {
+		dialTLS := t.DialTLS
+		t.DialTLSContext = track(func(_ context.Context, network, addr string) (net.Conn, error) {
+			return dialTLS(network, addr)
+		})
+	}
+}
 
 // proxyPoolFence tracks the current snapshot generation of every runtime that
 // publishes configs. Fencing is per publisher: a reload in one service must never
@@ -158,7 +209,9 @@ func RegisterProxyPoolPublisher() uint64 {
 	proxyPoolFence.Lock()
 	defer proxyPoolFence.Unlock()
 	proxyPoolFence.nextPublisher++
-	return proxyPoolFence.nextPublisher
+	publisher := proxyPoolFence.nextPublisher
+	proxyPoolConnections.Store(publisher, &shutdown.Connections{})
+	return publisher
 }
 
 // AdvanceProxyPoolGeneration publishes cfg as the current snapshot of publisher and
@@ -170,6 +223,12 @@ func AdvanceProxyPoolGeneration(publisher uint64, cfg *config.Config) {
 		return
 	}
 	proxyPoolFence.Lock()
+	if publisher != 0 {
+		if _, active := proxyPoolConnections.Load(publisher); !active {
+			proxyPoolFence.Unlock()
+			return
+		}
+	}
 	proxyPoolFence.nextGeneration++
 	generation := proxyPoolFence.nextGeneration
 	if proxyPoolFence.current == nil {
@@ -195,16 +254,38 @@ func AdvanceProxyPoolGeneration(publisher uint64, cfg *config.Config) {
 // a non-zero generation for this publisher will see current[publisher]==0 and remain
 // fenced out of the shared cache.
 func RetireProxyPoolPublisher(publisher uint64) {
+	_ = RetireProxyPoolPublisherContext(context.Background(), publisher)
+}
+
+func RetireProxyPoolPublisherContext(ctx context.Context, publisher uint64) error {
+	return retireProxyPoolPublisher(ctx, publisher, true)
+}
+
+func RetireProxyPoolPublisherLegacy(publisher uint64) {
+	_ = retireProxyPoolPublisher(context.Background(), publisher, false)
+}
+
+func retireProxyPoolPublisher(ctx context.Context, publisher uint64, interrupt bool) error {
 	if publisher == 0 {
-		return
+		return nil
 	}
 	proxyPoolFence.Lock()
 	delete(proxyPoolFence.current, publisher)
+	connections, tracked := proxyPoolConnections.LoadAndDelete(publisher)
 	toClose := proxyTransportCache.detachMatching(func(key proxyPoolKey) bool { return key.publisher == publisher })
 	proxyPoolFence.Unlock()
-	for _, t := range toClose {
-		t.CloseIdleConnections()
+	if tracked && interrupt {
+		connections.(*shutdown.Connections).Close()
 	}
+	if len(toClose) == 0 {
+		return nil
+	}
+	return shutdown.Run(ctx, func() error {
+		for _, t := range toClose {
+			t.CloseIdleConnections()
+		}
+		return nil
+	})
 }
 
 // ResetProxyTransports closes idle connections in cached explicit proxy transports.
@@ -269,7 +350,7 @@ func pooledTransport(kind proxyPoolKind, proxyURL string, cfg *config.Config, au
 	if cfg != nil {
 		publisher = cfg.ProxyPoolPublisher
 	}
-	cacheProxy, poolLabel := proxyPoolCacheTarget(setting)
+	cacheProxy, _ := proxyPoolCacheTarget(setting)
 	key := proxyPoolKey{
 		publisher:   publisher,
 		kind:        kind,
@@ -288,8 +369,8 @@ func pooledTransport(kind proxyPoolKind, proxyURL string, cfg *config.Config, au
 	// it with a transport built from retired settings.
 	if cfg != nil && cfg.ProxyPoolGeneration != 0 {
 		proxyPoolFence.RLock()
-		defer proxyPoolFence.RUnlock()
 		if cfg.ProxyPoolGeneration != proxyPoolFence.current[cfg.ProxyPoolPublisher] {
+			proxyPoolFence.RUnlock()
 			return unpooledTransport(build), true
 		}
 	}
@@ -319,9 +400,11 @@ func pooledTransport(kind proxyPoolKind, proxyURL string, cfg *config.Config, au
 				return stampProxyKeepAlive(conn), nil
 			}
 		}
-		log.Debugf("proxy connection pool: created transport kind=%d %s scope=%s idle=%s max=%d", kind, poolLabel, proxyPoolSecretScope("scope:", key.scope), idle, max)
 		return tr, nil
 	})
+	if cfg != nil && cfg.ProxyPoolGeneration != 0 {
+		proxyPoolFence.RUnlock()
+	}
 	if err != nil {
 		log.Errorf("proxy connection pool: %v", err)
 		return nil, true

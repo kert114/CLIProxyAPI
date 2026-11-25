@@ -642,7 +642,7 @@ func (c *homeDispatchConn) Close() error {
 	if c == nil || c.Conn == nil {
 		return net.ErrClosed
 	}
-	c.untrack()
+	defer c.untrack()
 	return c.Conn.Close()
 }
 

@@ -389,6 +389,10 @@ func applyHomeInFlightPublisherConfig(manager *coreauth.Manager, cfg internalcon
 }
 
 func (s *Service) startHomeSubscriber(ctx context.Context) {
+	s.startHomeSubscriberWithStartup(ctx, nil)
+}
+
+func (s *Service) startHomeSubscriberWithStartup(ctx, startupCtx context.Context) {
 	if s == nil {
 		return
 	}
@@ -421,7 +425,7 @@ func (s *Service) startHomeSubscriber(ctx context.Context) {
 	if !s.drainDetachedHomeLifetime(parentCtx) {
 		return
 	}
-	if parentCtx.Err() != nil {
+	if parentCtx.Err() != nil || (startupCtx != nil && s.startupStopped()) {
 		return
 	}
 

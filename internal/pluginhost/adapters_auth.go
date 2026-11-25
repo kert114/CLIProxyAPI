@@ -11,6 +11,7 @@ import (
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v8/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
@@ -91,7 +92,7 @@ func handlerDecodesBody(r *http.Request) bool {
 }
 
 func (h *Host) RegisterFrontendAuthProviders() {
-	if h == nil {
+	if h == nil || h.sharedRuntimeRetired.Load() {
 		return
 	}
 
@@ -101,7 +102,7 @@ func (h *Host) RegisterFrontendAuthProviders() {
 		priority int
 	}
 
-	nextKeys := make(map[string]struct{})
+	var providers []sdkaccess.OwnedProvider
 	var bestExclusive exclusiveFrontendAuthCandidate
 	for _, record := range h.activeRecords() {
 		provider := record.plugin.Capabilities.FrontendAuthProvider
@@ -120,8 +121,7 @@ func (h *Host) RegisterFrontendAuthProviders() {
 		if key == "" {
 			continue
 		}
-		sdkaccess.RegisterProvider(key, adapter)
-		nextKeys[key] = struct{}{}
+		providers = append(providers, sdkaccess.OwnedProvider{Key: key, Provider: adapter})
 		if record.plugin.Capabilities.FrontendAuthProviderExclusive {
 			candidate := exclusiveFrontendAuthCandidate{
 				key:      key,
@@ -136,32 +136,26 @@ func (h *Host) RegisterFrontendAuthProviders() {
 		}
 	}
 
-	if bestExclusive.key != "" {
-		sdkaccess.SetExclusiveProvider(bestExclusive.key)
-	} else {
-		sdkaccess.ClearExclusiveProvider()
+	h.frontendAuthMu.Lock()
+	defer h.frontendAuthMu.Unlock()
+	if !h.sharedRuntimeRetired.Load() {
+		sdkaccess.ReplaceOwnedProviders(h, providers, bestExclusive.key)
 	}
-	h.pruneStaleAccessProviders(nextKeys)
 }
 
-func (h *Host) pruneStaleAccessProviders(nextKeys map[string]struct{}) {
-	if h == nil {
-		return
+// RetireSharedRuntime fences late publication and removes this host's
+// process-wide capabilities before asynchronous plugin teardown starts.
+func (h *Host) RetireSharedRuntime() {
+	h.sharedRuntimeRetired.Store(true)
+	h.frontendAuthMu.Lock()
+	sdkaccess.ReplaceOwnedProviders(h, nil, "")
+	h.frontendAuthMu.Unlock()
+	thinkingOwner.Lock()
+	if thinkingOwner.host == h {
+		thinking.ClearPluginProviders()
+		thinkingOwner.host = nil
 	}
-
-	staleKeys := make([]string, 0)
-	h.mu.Lock()
-	for key := range h.accessProviderKeys {
-		if _, okKey := nextKeys[key]; !okKey {
-			staleKeys = append(staleKeys, key)
-		}
-	}
-	h.accessProviderKeys = nextKeys
-	h.mu.Unlock()
-
-	for _, key := range staleKeys {
-		sdkaccess.UnregisterProvider(key)
-	}
+	thinkingOwner.Unlock()
 }
 
 type accessAdapter struct {
