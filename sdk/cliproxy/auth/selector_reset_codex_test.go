@@ -1,0 +1,185 @@
+package auth
+
+import (
+	"context"
+	"net/http"
+	"strconv"
+	"testing"
+	"time"
+
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+)
+
+// codexWindow describes one Codex rate-limit window as reported upstream.
+type codexWindow struct {
+	minutes    int
+	usedPct    string
+	resetAt    time.Time
+	resetAfter time.Duration
+}
+
+func codexResetAuth(id string, observedAt time.Time, extra http.Header, windows map[string]codexWindow) *Auth {
+	candidate := &Auth{ID: id, Provider: "codex"}
+	headers := make(http.Header)
+	for name, value := range extra {
+		headers[name] = value
+	}
+	for name, window := range windows {
+		prefix := "X-Codex-" + name + "-"
+		headers.Set(prefix+"Window-Minutes", strconv.Itoa(window.minutes))
+		if window.usedPct != "" {
+			headers.Set(prefix+"Used-Percent", window.usedPct)
+		}
+		if !window.resetAt.IsZero() {
+			headers.Set(prefix+"Reset-At", strconv.FormatInt(window.resetAt.Unix(), 10))
+		}
+		if window.resetAfter > 0 {
+			headers.Set(prefix+"Reset-After-Seconds", strconv.FormatInt(int64(window.resetAfter/time.Second), 10))
+		}
+	}
+	candidate.Quota.ObserveResponseHeadersForProvider("codex", headers, observedAt)
+	return candidate
+}
+
+func pickCodex(t *testing.T, selector Selector, opts cliproxyexecutor.Options, auths []*Auth) string {
+	t.Helper()
+	got, err := selector.Pick(context.Background(), "codex", "gpt-5", opts, auths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return got.ID
+}
+
+const weekMinutes = 7 * 24 * 60
+
+func TestResetFirstCodexPrefersEarlierWeeklyReset(t *testing.T) {
+	now := time.Now()
+	gmail := codexResetAuth("gmail", now, nil, map[string]codexWindow{
+		"Primary": {minutes: weekMinutes, usedPct: "35", resetAt: now.Add(5*24*time.Hour + 14*time.Hour)},
+	})
+	work := codexResetAuth("work", now, nil, map[string]codexWindow{
+		"Primary": {minutes: weekMinutes, usedPct: "80", resetAt: now.Add(15 * time.Hour)},
+	})
+	selector := &ResetFirstSelector{}
+	for i := 0; i < 4; i++ {
+		if got := pickCodex(t, selector, cliproxyexecutor.Options{}, []*Auth{gmail, work}); got != "work" {
+			t.Fatalf("pick %d = %q, want work (weekly resets in 15h)", i, got)
+		}
+	}
+}
+
+func TestResetFirstCodexTwoWindowsUsesLongestForOrderAndShortForGuard(t *testing.T) {
+	now := time.Now()
+	// Weekly sits in Secondary here; the window length, not the name, decides.
+	early := codexResetAuth("early", now, nil, map[string]codexWindow{
+		"Primary":   {minutes: 300, usedPct: "10", resetAt: now.Add(4 * time.Hour)},
+		"Secondary": {minutes: weekMinutes, usedPct: "50", resetAt: now.Add(24 * time.Hour)},
+	})
+	late := codexResetAuth("late", now, nil, map[string]codexWindow{
+		"Primary":   {minutes: 300, usedPct: "10", resetAt: now.Add(time.Hour)},
+		"Secondary": {minutes: weekMinutes, usedPct: "50", resetAt: now.Add(72 * time.Hour)},
+	})
+	selector := &ResetFirstSelector{}
+	if got := pickCodex(t, selector, cliproxyexecutor.Options{}, []*Auth{late, early}); got != "early" {
+		t.Fatalf("picked %q, want early (earlier weekly reset beats earlier five-hour reset)", got)
+	}
+	early = codexResetAuth("early", now, nil, map[string]codexWindow{
+		"Primary":   {minutes: 300, usedPct: "85", resetAt: now.Add(4 * time.Hour)},
+		"Secondary": {minutes: weekMinutes, usedPct: "50", resetAt: now.Add(24 * time.Hour)},
+	})
+	if got := pickCodex(t, selector, cliproxyexecutor.Options{}, []*Auth{late, early}); got != "late" {
+		t.Fatalf("picked %q, want late (early is at 85%% of its five-hour window)", got)
+	}
+}
+
+func TestResetFirstCodexSingleHighWeeklyUsageDoesNotTripGuard(t *testing.T) {
+	now := time.Now()
+	nearlyDone := codexResetAuth("nearly-done", now, nil, map[string]codexWindow{
+		"Primary": {minutes: weekMinutes, usedPct: "95", resetAt: now.Add(10 * time.Hour)},
+	})
+	fresh := codexResetAuth("fresh", now, nil, map[string]codexWindow{
+		"Primary": {minutes: weekMinutes, usedPct: "5", resetAt: now.Add(100 * time.Hour)},
+	})
+	if got := pickCodex(t, &ResetFirstSelector{}, cliproxyexecutor.Options{}, []*Auth{fresh, nearlyDone}); got != "nearly-done" {
+		t.Fatalf("picked %q, want nearly-done (weekly usage is spent before it resets)", got)
+	}
+}
+
+func TestResetFirstCodexResetAfterSecondsUsesObservationTime(t *testing.T) {
+	now := time.Now()
+	a := codexResetAuth("a", now.Add(-2*time.Hour), nil, map[string]codexWindow{
+		"Primary": {minutes: weekMinutes, resetAfter: 10 * time.Hour}, // resets in 8h
+	})
+	b := codexResetAuth("b", now, nil, map[string]codexWindow{
+		"Primary": {minutes: weekMinutes, resetAfter: 9 * time.Hour},
+	})
+	if got := pickCodex(t, &ResetFirstSelector{}, cliproxyexecutor.Options{}, []*Auth{b, a}); got != "a" {
+		t.Fatalf("picked %q, want a (observed 2h ago with 10h left)", got)
+	}
+}
+
+func TestResetFirstCodexIgnoresAdditionalLimitWindows(t *testing.T) {
+	now := time.Now()
+	extra := http.Header{}
+	extra.Set("X-Codex-Bengalfox-Primary-Window-Minutes", strconv.Itoa(weekMinutes*4))
+	extra.Set("X-Codex-Bengalfox-Primary-Reset-At", strconv.FormatInt(now.Add(time.Hour).Unix(), 10))
+	a := codexResetAuth("a", now, extra, map[string]codexWindow{
+		"Primary": {minutes: weekMinutes, resetAt: now.Add(48 * time.Hour)},
+	})
+	b := codexResetAuth("b", now, nil, map[string]codexWindow{
+		"Primary": {minutes: weekMinutes, resetAt: now.Add(24 * time.Hour)},
+	})
+	if got := pickCodex(t, &ResetFirstSelector{}, cliproxyexecutor.Options{}, []*Auth{a, b}); got != "b" {
+		t.Fatalf("picked %q, want b (additional limit windows must not order accounts)", got)
+	}
+}
+
+func TestResetFirstCodexUnknownWeeklyUsesRoundRobin(t *testing.T) {
+	now := time.Now()
+	known := codexResetAuth("a", now, nil, map[string]codexWindow{
+		"Primary": {minutes: weekMinutes, resetAt: now.Add(24 * time.Hour)},
+	})
+	expired := codexResetAuth("b", now, nil, map[string]codexWindow{
+		"Primary": {minutes: weekMinutes, resetAt: now.Add(-time.Minute)},
+	})
+	selector := &ResetFirstSelector{}
+	for i, want := range []string{"a", "b", "a", "b"} {
+		if got := pickCodex(t, selector, cliproxyexecutor.Options{}, []*Auth{known, expired}); got != want {
+			t.Fatalf("pick %d = %q, want %q", i, got, want)
+		}
+	}
+}
+
+func TestResetFirstMixedPoolOrdersAcrossProviders(t *testing.T) {
+	now := time.Now()
+	claude := resetTestAuth("claude", now.Add(48*time.Hour), now.Add(time.Hour))
+	codex := codexResetAuth("codex", now, nil, map[string]codexWindow{
+		"Primary": {minutes: weekMinutes, resetAt: now.Add(24 * time.Hour)},
+	})
+	got, err := (&ResetFirstSelector{}).Pick(context.Background(), "mixed", "shared-alias", cliproxyexecutor.Options{}, []*Auth{claude, codex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != "codex" {
+		t.Fatalf("picked %q, want codex (earlier weekly reset)", got.ID)
+	}
+}
+
+func TestResetFirstDevinUsesWeeklyThenDailyGuard(t *testing.T) {
+	now := time.Now()
+	devin := func(id string, weekly time.Duration, dailyRemaining string) *Auth {
+		return &Auth{ID: id, Provider: "devin", Quota: QuotaState{ObservedAt: now, Signals: map[string]string{
+			"weekly_quota_reset_at":         now.Add(weekly).Format(time.RFC3339),
+			"daily_quota_reset_at":          now.Add(6 * time.Hour).Format(time.RFC3339),
+			"daily_quota_remaining_percent": dailyRemaining,
+		}}}
+	}
+	got, err := (&ResetFirstSelector{}).Pick(context.Background(), "devin", "swe", cliproxyexecutor.Options{}, []*Auth{devin("late", 72*time.Hour, "90%"), devin("early", 24*time.Hour, "90%")})
+	if err != nil || got.ID != "early" {
+		t.Fatalf("picked %v (err %v), want early", got, err)
+	}
+	got, err = (&ResetFirstSelector{}).Pick(context.Background(), "devin", "swe", cliproxyexecutor.Options{}, []*Auth{devin("late", 72*time.Hour, "90%"), devin("early", 24*time.Hour, "10%")})
+	if err != nil || got.ID != "late" {
+		t.Fatalf("picked %v (err %v), want late (early has 10%% of its daily quota left)", got, err)
+	}
+}
