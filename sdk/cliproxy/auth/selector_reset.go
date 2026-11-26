@@ -2,7 +2,6 @@ package auth
 
 import (
 	"context"
-	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -12,7 +11,7 @@ import (
 )
 
 const (
-	// resetFirstFiveHourLimit is the observed five-hour utilization at which an account
+	// resetFirstFiveHourLimit is the observed short-window utilization at which an account
 	// stops receiving new work while another account in the same group has headroom.
 	resetFirstFiveHourLimit = 0.8
 	// subagentRequestMetadataKey marks requests that SessionAffinitySelector identified as subagents.
@@ -23,11 +22,15 @@ const (
 	AttributeSubagentOnly = "subagent_only"
 )
 
-// ResetFirstSelector consumes Claude accounts in weekly-reset order, then five-hour
-// reset order. Missing weekly observations use round-robin so every account can
-// acquire a snapshot through normal requests. Other providers retain round-robin.
+// ResetFirstSelector consumes subscription accounts in long-window (weekly) reset
+// order, then short-window (for example five-hour) reset order. It reads each
+// account's last observed quota windows through observedQuotaWindows, so any
+// provider with a window parser takes part. Accounts whose weekly reset is unknown,
+// including providers without a parser, use round-robin so every account can acquire
+// a snapshot through normal requests. Pools that include a provider without a parser
+// keep plain round-robin.
 // Before ordering, subagent_only accounts are reserved for subagent requests and
-// accounts near their five-hour limit are skipped while a peer has headroom.
+// accounts near their short-window limit are skipped while a peer has headroom.
 // Wrap it in SessionAffinitySelector to keep existing conversations on their account.
 type ResetFirstSelector struct {
 	fallback RoundRobinSelector
@@ -35,7 +38,7 @@ type ResetFirstSelector struct {
 
 func (s *ResetFirstSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	provider = strings.ToLower(strings.TrimSpace(provider))
-	if provider != "claude" && provider != "mixed" {
+	if provider != "mixed" && !supportsQuotaWindows(provider) {
 		return s.fallback.Pick(ctx, provider, model, opts, auths)
 	}
 	now := time.Now()
@@ -43,26 +46,25 @@ func (s *ResetFirstSelector) Pick(ctx context.Context, provider, model string, o
 	if err != nil {
 		return nil, err
 	}
-	if provider == "mixed" {
-		for _, candidate := range available {
-			if !strings.EqualFold(strings.TrimSpace(candidate.Provider), "claude") {
-				return s.fallback.Pick(ctx, provider, model, opts, available)
-			}
+	for _, candidate := range available {
+		if !supportsQuotaWindows(candidate.Provider) {
+			return s.fallback.Pick(ctx, provider, model, opts, available)
 		}
 	}
+	available = preferCodexWebsocketAuths(ctx, poolProvider(provider, available), available)
 	full, _ := opts.Metadata[subagentFullAuthsMetadataKey].(map[string]bool)
 	available = resetFirstCandidates(available, isSubagentRequest(opts), full, now)
 	var selected *Auth
-	var selectedWeekly, selectedFiveHour time.Time
+	var selectedWindows quotaWindows
 	for _, candidate := range available {
-		weekly := claudeResetTime(candidate.Quota.Signals, "7d", now)
-		if weekly.IsZero() {
+		windows := observedQuotaWindows(candidate, now)
+		if windows.longReset.IsZero() {
 			return s.fallback.Pick(ctx, provider, model, opts, available)
 		}
-		fiveHour := claudeResetTime(candidate.Quota.Signals, "5h", now)
-		if selected == nil || weekly.Before(selectedWeekly) ||
-			(weekly.Equal(selectedWeekly) && !fiveHour.IsZero() && (selectedFiveHour.IsZero() || fiveHour.Before(selectedFiveHour))) {
-			selected, selectedWeekly, selectedFiveHour = candidate, weekly, fiveHour
+		if selected == nil || windows.longReset.Before(selectedWindows.longReset) ||
+			(windows.longReset.Equal(selectedWindows.longReset) && !windows.shortReset.IsZero() &&
+				(selectedWindows.shortReset.IsZero() || windows.shortReset.Before(selectedWindows.shortReset))) {
+			selected, selectedWindows = candidate, windows
 		}
 	}
 	return selected, nil
@@ -100,25 +102,11 @@ func resetFirstCandidates(auths []*Auth, subagent bool, full map[string]bool, no
 func withFiveHourHeadroom(auths []*Auth, now time.Time) []*Auth {
 	var out []*Auth
 	for _, candidate := range auths {
-		if claudeFiveHourUtilization(candidate.Quota.Signals, now) < resetFirstFiveHourLimit {
+		if observedQuotaWindows(candidate, now).shortUsed < resetFirstFiveHourLimit {
 			out = append(out, candidate)
 		}
 	}
 	return out
-}
-
-// claudeFiveHourUtilization returns the last observed five-hour utilization (0-1),
-// or 0 when the observation is missing or its window has already reset.
-func claudeFiveHourUtilization(signals map[string]string, now time.Time) float64 {
-	if claudeResetTime(signals, "5h", now).IsZero() {
-		return 0
-	}
-	raw := strings.TrimSpace(signals[http.CanonicalHeaderKey("Anthropic-Ratelimit-Unified-5h-Utilization")])
-	utilization, errParse := strconv.ParseFloat(raw, 64)
-	if errParse != nil || math.IsNaN(utilization) || math.IsInf(utilization, 0) {
-		return 0
-	}
-	return utilization
 }
 
 func authSubagentOnly(auth *Auth) bool {
@@ -150,16 +138,18 @@ func hasSubagentRoleHeader(headers http.Header) bool {
 	return strings.EqualFold(strings.TrimSpace(headers.Get(SessionRoleHeader)), "subagent")
 }
 
-func claudeResetTime(signals map[string]string, window string, now time.Time) time.Time {
-	raw := strings.TrimSpace(signals[http.CanonicalHeaderKey("Anthropic-Ratelimit-Unified-"+window+"-Reset")])
-	var reset time.Time
-	if seconds, errParse := strconv.ParseInt(raw, 10, 64); errParse == nil {
-		reset = time.Unix(seconds, 0)
-	} else {
-		reset, _ = time.Parse(time.RFC3339, raw)
+// poolProvider returns the single provider behind a "mixed" pool, so provider-specific
+// preferences such as the Codex websocket transport still apply when only one provider
+// is configured. Pools with several providers keep "mixed".
+func poolProvider(provider string, auths []*Auth) string {
+	if provider != "mixed" || len(auths) == 0 {
+		return provider
 	}
-	if !reset.After(now) {
-		return time.Time{}
+	only := strings.ToLower(strings.TrimSpace(auths[0].Provider))
+	for _, candidate := range auths[1:] {
+		if !strings.EqualFold(strings.TrimSpace(candidate.Provider), only) {
+			return provider
+		}
 	}
-	return reset
+	return only
 }

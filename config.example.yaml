@@ -174,12 +174,14 @@ access:
 # Routing strategy for selecting credentials when multiple match.
 routing:
   strategy: "round-robin" # round-robin (default), weighted-round-robin, fill-first, reset-first
-  # reset-first consumes Claude accounts by earliest weekly reset, then earliest 5h reset.
+  # reset-first consumes subscription accounts by earliest weekly reset, then earliest
+  # short-window (5h or daily) reset. It currently reads Claude, Codex and Devin quota
+  # observations; providers without a quota parser use round-robin.
   # Uses passive response headers; missing or expired weekly resets fall back to round-robin
-  # until normal requests supply current observations. Other providers use round-robin.
+  # until normal requests supply current observations.
   # Enable session-affinity below to keep existing chats on their assigned account.
-  # reset-first skips accounts whose last observed 5h utilization is at least 80% while
-  # another account in the same group has headroom.
+  # reset-first skips accounts whose last observed short-window utilization is at least 80%
+  # while another account in the same group has headroom.
   # Add a top-level "subagent_only": true to a Claude auth JSON to reserve it for subagents:
   # requests detected as subagents (Claude Code agent IDs, parent session IDs, or the
   # X-CLIProxy-Session-Role: subagent header) prefer it, and top-level chats use it only when

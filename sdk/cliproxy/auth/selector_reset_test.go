@@ -81,12 +81,16 @@ func TestResetFirstSelectorUnknownWeeklyUsesRoundRobin(t *testing.T) {
 	}
 }
 
-func TestResetFirstSelectorOtherProvidersRemainRoundRobin(t *testing.T) {
+func TestResetFirstSelectorProvidersWithoutResetParserRemainRoundRobin(t *testing.T) {
 	selector := &ResetFirstSelector{}
 	now := time.Now()
+	// Gemini has no reset-window parser, so Claude-shaped signals on its accounts are ignored.
 	auths := []*Auth{resetTestAuth("a", now.Add(48*time.Hour), now.Add(time.Hour)), resetTestAuth("b", now.Add(24*time.Hour), now.Add(time.Hour))}
+	for _, candidate := range auths {
+		candidate.Provider = "gemini"
+	}
 	for i, want := range []string{"a", "b", "a"} {
-		got, err := selector.Pick(context.Background(), "codex", "gpt", cliproxyexecutor.Options{}, auths)
+		got, err := selector.Pick(context.Background(), "gemini", "gemini-pro", cliproxyexecutor.Options{}, auths)
 		if err != nil {
 			t.Fatal(err)
 		}
