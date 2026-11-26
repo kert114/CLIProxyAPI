@@ -110,8 +110,12 @@ type Service struct {
 	// pluginHost owns dynamic plugin lifecycle and runtime capability adapters.
 	pluginHost *pluginhost.Host
 
-	// shutdownOnce ensures shutdown is called only once.
-	shutdownOnce sync.Once
+	// Admission protects publication and closure of the native API listener.
+	// Closing admission also fences positive-mode configuration and startup work.
+	admissionMu     sync.Mutex
+	admissionClosed chan struct{}
+	shutdownConfig  atomic.Pointer[config.Config]
+	shutdownState   atomic.Pointer[serviceShutdown]
 
 	// wsGateway manages websocket Gemini providers.
 	wsGateway *wsrelay.Manager
@@ -151,6 +155,15 @@ type Service struct {
 	antigravityRefreshPending map[string]*antigravityModelRefreshRequest
 	antigravityPersistPending map[string]*antigravityHintPersistRequest
 	antigravityPersistActive  map[string]*antigravityHintPersistRequest
+}
+
+type serviceShutdown struct {
+	budget   time.Duration
+	ctx      context.Context
+	once     sync.Once
+	drainCtx context.Context
+	done     chan struct{}
+	result   shutdownResult // published by closing done
 }
 
 // SetResultPolicy sets an execution result policy on the underlying core auth manager.

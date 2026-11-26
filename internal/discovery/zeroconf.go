@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -72,11 +73,11 @@ func validateRegisterProxyArgs(instance, service, domain string, port int, host 
 	return nil
 }
 
-func defaultRegisterProxy(instance, service, domain string, port int, host string, ips []string, text []string, ifaces []net.Interface, _ ...zeroconf.ServerOption) (zeroconfServer, error) {
+func (a *ZeroconfAdvertiser) registerResponder(instance, service, domain string, port int, host string, ips []string, text []string, ifaces []net.Interface, _ ...zeroconf.ServerOption) (zeroconfServer, error) {
 	if errValid := validateRegisterProxyArgs(instance, service, domain, port, host, ips); errValid != nil {
 		return nil, errValid
 	}
-	resp, err := newHostRecordResponderWithRebind(nil, host, domain, ips, ifaces, nil)
+	resp, err := newHostRecordResponderWithRebind(nil, host, domain, ips, ifaces, nil, a.listeners)
 	if err != nil {
 		return nil, err
 	}
@@ -868,26 +869,27 @@ func buildServiceQueryReplyFiltered(query []byte, svc mdnsServiceConfig, hostFQD
 }
 
 type hostRecordResponder struct {
-	mu            sync.Mutex
-	inner         zeroconfServer
-	svc           mdnsServiceConfig
-	baseHost      string
-	osHost        string
-	domain        string
-	attempt       int
-	hostFQDN      string
-	fixedIPs      []string
-	ifaces        []net.Interface
-	rebindInner   func(string) (zeroconfServer, error)
-	probeConflict hostConflictProbeFunc
-	onSend        func(hostFQDN string, unicast bool, pkt []byte)
-	inConflict    bool
-	stopped       bool
-	ipv4conn      *ipv4.PacketConn
-	ipv6conn      *ipv6.PacketConn
-	stopCh        chan struct{}
-	wg            sync.WaitGroup
-	shutdownOnce  sync.Once
+	mu             sync.Mutex
+	inner          zeroconfServer
+	svc            mdnsServiceConfig
+	baseHost       string
+	osHost         string
+	domain         string
+	attempt        int
+	hostFQDN       string
+	fixedIPs       []string
+	ifaces         []net.Interface
+	rebindInner    func(string) (zeroconfServer, error)
+	probeConflict  hostConflictProbeFunc
+	onSend         func(hostFQDN string, unicast bool, pkt []byte)
+	inConflict     bool
+	stopped        bool
+	ipv4conn       *ipv4.PacketConn
+	ipv6conn       *ipv6.PacketConn
+	releaseSockets func()
+	stopCh         chan struct{}
+	wg             sync.WaitGroup
+	shutdownOnce   sync.Once
 }
 
 func (r *hostRecordResponder) configureService(instance, service, domain string, port int, text []string) {
@@ -977,32 +979,35 @@ func (r *hostRecordResponder) scheduleServiceAnnouncements(repetitions int, init
 }
 
 func newHostRecordResponder(inner zeroconfServer, host, domain string, fixedIPs []string, ifaces []net.Interface) (zeroconfServer, error) {
-	return newHostRecordResponderWithRebind(inner, host, domain, fixedIPs, ifaces, nil)
+	return newHostRecordResponderWithRebind(inner, host, domain, fixedIPs, ifaces, nil, nil)
 }
 
-func newHostRecordResponderWithRebind(inner zeroconfServer, host, domain string, fixedIPs []string, ifaces []net.Interface, rebind func(string) (zeroconfServer, error)) (zeroconfServer, error) {
-	ipv4conn, err4 := openMDNSConn4(ifaces)
-	ipv6conn, err6 := openMDNSConn6(ifaces)
+func newHostRecordResponderWithRebind(inner zeroconfServer, host, domain string, fixedIPs []string, ifaces []net.Interface, rebind func(string) (zeroconfServer, error), listeners *Listeners) (zeroconfServer, error) {
+	listen, release := listeners.socketGroup()
+	ipv4conn, err4 := openMDNSConn4(ifaces, listen)
+	ipv6conn, err6 := openMDNSConn6(ifaces, listen)
 	if ipv4conn == nil && ipv6conn == nil {
+		release()
 		if inner != nil {
 			inner.Shutdown()
 		}
 		return nil, fmt.Errorf("discovery: failed to start host record responder (ipv4: %v, ipv6: %v)", err4, err6)
 	}
 	r := &hostRecordResponder{
-		inner:         inner,
-		baseHost:      host,
-		osHost:        extractCleanHost(),
-		domain:        domain,
-		attempt:       1,
-		hostFQDN:      formatHostFQDN(host, domain),
-		fixedIPs:      append([]string(nil), fixedIPs...),
-		ifaces:        append([]net.Interface(nil), ifaces...),
-		rebindInner:   rebind,
-		probeConflict: probeHostConflictOnLAN,
-		ipv4conn:      ipv4conn,
-		ipv6conn:      ipv6conn,
-		stopCh:        make(chan struct{}),
+		inner:          inner,
+		baseHost:       host,
+		osHost:         extractCleanHost(),
+		domain:         domain,
+		attempt:        1,
+		hostFQDN:       formatHostFQDN(host, domain),
+		fixedIPs:       append([]string(nil), fixedIPs...),
+		ifaces:         append([]net.Interface(nil), ifaces...),
+		rebindInner:    rebind,
+		probeConflict:  listeners.probeHostConflict,
+		ipv4conn:       ipv4conn,
+		ipv6conn:       ipv6conn,
+		releaseSockets: release,
+		stopCh:         make(chan struct{}),
 	}
 	if r.ipv4conn != nil {
 		r.wg.Add(1)
@@ -1015,8 +1020,8 @@ func newHostRecordResponderWithRebind(inner zeroconfServer, host, domain string,
 	return r, nil
 }
 
-func openMDNSConn4(ifaces []net.Interface) (*ipv4.PacketConn, error) {
-	udpConn, err := net.ListenUDP("udp4", mdnsWildcardAddrIPv4)
+func openMDNSConn4(ifaces []net.Interface, listen listenUDPFunc) (*ipv4.PacketConn, error) {
+	udpConn, err := listen("udp4", mdnsWildcardAddrIPv4)
 	if err != nil {
 		return nil, err
 	}
@@ -1042,8 +1047,8 @@ func openMDNSConn4(ifaces []net.Interface) (*ipv4.PacketConn, error) {
 	return pkConn, nil
 }
 
-func openMDNSConn6(ifaces []net.Interface) (*ipv6.PacketConn, error) {
-	udpConn, err := net.ListenUDP("udp6", mdnsWildcardAddrIPv6)
+func openMDNSConn6(ifaces []net.Interface, listen listenUDPFunc) (*ipv6.PacketConn, error) {
+	udpConn, err := listen("udp6", mdnsWildcardAddrIPv6)
 	if err != nil {
 		return nil, err
 	}
@@ -1115,6 +1120,9 @@ func (r *hostRecordResponder) recv4() {
 		default:
 			n, cm, from, err := r.ipv4conn.ReadFrom(buf)
 			if err != nil {
+				if errors.Is(err, net.ErrClosed) {
+					return
+				}
 				continue
 			}
 			ifIndex := 0
@@ -1140,6 +1148,9 @@ func (r *hostRecordResponder) recv6() {
 		default:
 			n, cm, from, err := r.ipv6conn.ReadFrom(buf)
 			if err != nil {
+				if errors.Is(err, net.ErrClosed) {
+					return
+				}
 				continue
 			}
 			ifIndex := 0
@@ -1589,6 +1600,9 @@ func (r *hostRecordResponder) Shutdown() {
 		if r.ipv6conn != nil {
 			_ = r.ipv6conn.Close()
 		}
+		if r.releaseSockets != nil {
+			r.releaseSockets()
+		}
 		r.wg.Wait()
 		if inner != nil {
 			inner.Shutdown()
@@ -1599,6 +1613,7 @@ func (r *hostRecordResponder) Shutdown() {
 // ZeroconfAdvertiser wraps libp2p/zeroconf/v2 Server with defensive lifecycle management.
 type ZeroconfAdvertiser struct {
 	mu                sync.Mutex
+	listeners         *Listeners
 	server            zeroconfServer
 	inFlight          bool
 	closed            bool
@@ -1611,6 +1626,11 @@ type ZeroconfAdvertiser struct {
 // NewZeroconfAdvertiser returns a new ZeroconfAdvertiser.
 func NewZeroconfAdvertiser() *ZeroconfAdvertiser {
 	return &ZeroconfAdvertiser{}
+}
+
+// NewAdvertiser creates a built-in advertiser owned by this listener set.
+func (l *Listeners) NewAdvertiser() Advertiser {
+	return &ZeroconfAdvertiser{listeners: l}
 }
 
 func cleanHostname(h string) string {
@@ -2154,6 +2174,10 @@ func runHostProbeSchedule(ctx context.Context, probeCount int, probeInterval tim
 }
 
 func probeHostConflictOnLAN(ctx context.Context, hostFQDN string, ifaces []net.Interface, localIPs []string) (bool, error) {
+	return (*Listeners)(nil).probeHostConflict(ctx, hostFQDN, ifaces, localIPs)
+}
+
+func (l *Listeners) probeHostConflict(ctx context.Context, hostFQDN string, ifaces []net.Interface, localIPs []string) (bool, error) {
 	if len(ifaces) == 0 {
 		return false, fmt.Errorf("discovery: cannot probe host conflict with empty interface list")
 	}
@@ -2178,6 +2202,8 @@ func probeHostConflictOnLAN(ctx context.Context, hostFQDN string, ifaces []net.I
 		isMulticastDst bool
 	}
 	var conns []probeConn
+	listen, release := l.socketGroup()
+	defer release()
 	defer func() {
 		for _, c := range conns {
 			_ = c.conn.Close()
@@ -2187,7 +2213,7 @@ func probeHostConflictOnLAN(ctx context.Context, hostFQDN string, ifaces []net.I
 	ownPorts := make(map[int]struct{}, 2)
 	ownPort4 := 0
 	ownPort6 := 0
-	if mConn4, errM4 := net.ListenUDP("udp4", mdnsWildcardAddrIPv4); errM4 == nil {
+	if mConn4, errM4 := listen("udp4", mdnsWildcardAddrIPv4); errM4 == nil {
 		mp4 := ipv4.NewPacketConn(mConn4)
 		_ = mp4.SetControlMessage(ipv4.FlagInterface|ipv4.FlagDst, true)
 		joined := 0
@@ -2203,7 +2229,7 @@ func probeHostConflictOnLAN(ctx context.Context, hostFQDN string, ifaces []net.I
 			_ = mConn4.Close()
 		}
 	}
-	if mConn6, errM6 := net.ListenUDP("udp6", mdnsWildcardAddrIPv6); errM6 == nil {
+	if mConn6, errM6 := listen("udp6", mdnsWildcardAddrIPv6); errM6 == nil {
 		mp6 := ipv6.NewPacketConn(mConn6)
 		_ = mp6.SetControlMessage(ipv6.FlagInterface|ipv6.FlagDst, true)
 		joined := 0
@@ -2223,7 +2249,7 @@ func probeHostConflictOnLAN(ctx context.Context, hostFQDN string, ifaces []net.I
 	var pConn4 *ipv4.PacketConn
 	var pConn6 *ipv6.PacketConn
 	var lastInitErr error
-	if uConn4, errListen4 := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0}); errListen4 != nil {
+	if uConn4, errListen4 := listen("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0}); errListen4 != nil {
 		lastInitErr = errListen4
 	} else {
 		pConn4 = ipv4.NewPacketConn(uConn4)
@@ -2234,7 +2260,7 @@ func probeHostConflictOnLAN(ctx context.Context, hostFQDN string, ifaces []net.I
 			ownPort4 = laddr.Port
 		}
 	}
-	if uConn6, errListen6 := net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6zero, Port: 0}); errListen6 != nil {
+	if uConn6, errListen6 := listen("udp6", &net.UDPAddr{IP: net.IPv6zero, Port: 0}); errListen6 != nil {
 		lastInitErr = errListen6
 	} else {
 		pConn6 = ipv6.NewPacketConn(uConn6)
@@ -2598,6 +2624,9 @@ func (a *ZeroconfAdvertiser) Start(ctx context.Context, spec ServiceSpec) (err e
 	if probeConflict == nil && a.registerProxy != nil {
 		probeConflict = func(context.Context, string, []net.Interface, []string) (bool, error) { return false, nil }
 	}
+	if probeConflict == nil {
+		probeConflict = a.listeners.probeHostConflict
+	}
 	baseHost := buildAdvertisedHost(spec.InstanceName, cleanHost)
 	advertisedHost, initialAttempt, errHost := resolveAdvertisedHostCandidate(ctx, baseHost, 1, cleanHost, domain, spec.Interfaces, localIPs, probeConflict)
 	if errHost != nil {
@@ -2616,7 +2645,7 @@ func (a *ZeroconfAdvertiser) Start(ctx context.Context, spec ServiceSpec) (err e
 
 	registerProxy := a.registerProxy
 	if registerProxy == nil {
-		registerProxy = defaultRegisterProxy
+		registerProxy = a.registerResponder
 	}
 
 	var errRegister error

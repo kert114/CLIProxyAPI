@@ -33,13 +33,19 @@ func (s *Service) currentWatcher() *WatcherWrapper {
 	return w
 }
 
-func (s *Service) setWatcher(w *WatcherWrapper) {
+func (s *Service) setWatcher(w *WatcherWrapper) bool {
 	if s == nil {
-		return
+		return false
 	}
 	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+	s.admissionMu.Lock()
+	defer s.admissionMu.Unlock()
+	if s.admissionStopped() {
+		return false
+	}
 	s.watcher = w
-	s.cfgMu.Unlock()
+	return true
 }
 
 func (s *Service) applyConfigUpdate(newCfg *config.Config) {
@@ -136,7 +142,7 @@ func (s *Service) applyConfigUpdateWithAuthSynthesis(ctx context.Context, newCfg
 // may block on plugins, storage, or networking is deliberately deferred. Catalog
 // source generations change here so an older commit cannot restart stale readers.
 func (s *Service) commitConfigUpdate(newCfg *config.Config) configCommit {
-	if s == nil {
+	if s == nil || s.admissionStopped() {
 		return configCommit{}
 	}
 
@@ -162,13 +168,38 @@ func (s *Service) commitConfigUpdate(newCfg *config.Config) configCommit {
 	}
 	// Clone before assigning the generation: callers may still hold the input snapshot.
 	newCfg = newCfg.CloneForRuntime()
+	if s.admissionStopped() {
+		return configCommit{}
+	}
 	helps.AdvanceProxyPoolGeneration(s.proxyPoolPublisher, newCfg)
 	s.cfgMu.Lock()
+	s.admissionMu.Lock()
+	if s.admissionStopped() {
+		s.admissionMu.Unlock()
+		s.cfgMu.Unlock()
+		return configCommit{}
+	}
 	s.cfg = newCfg
+	s.shutdownConfig.Store(newCfg)
+	s.admissionMu.Unlock()
 	s.cfgMu.Unlock()
 	s.cancelStaleAntigravityProbes("")
 	s.configSequence++
-	registry.UpdateModelCatalogSources(newCfg.Models, newCfg.Home.Enabled)
+	if s.admissionStopped() {
+		return configCommit{}
+	}
+	published := registry.UpdateModelCatalogSourcesGuarded(newCfg.Models, newCfg.Home.Enabled, func(publish func()) bool {
+		s.admissionMu.Lock()
+		defer s.admissionMu.Unlock()
+		if s.admissionStopped() {
+			return false
+		}
+		publish()
+		return true
+	})
+	if !published {
+		return configCommit{}
+	}
 	return configCommit{cfg: newCfg, sequence: s.configSequence}
 }
 
@@ -177,7 +208,7 @@ func (s *Service) configCommitCurrent(commit configCommit) bool {
 		return false
 	}
 	s.configUpdateMu.Lock()
-	current := s.configSequence == commit.sequence
+	current := s.configSequence == commit.sequence && !s.admissionStopped()
 	s.configUpdateMu.Unlock()
 	return current
 }
@@ -195,36 +226,40 @@ func (s *Service) applyConfigRuntime(ctx context.Context, commit configCommit, s
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if errContext := ctx.Err(); errContext != nil {
+	stopped := func() bool { return s.admissionStopped() || ctx.Err() != nil }
+	if stopped() {
 		return false
 	}
 
 	if !s.applyManagerConfig(ctx, commit) {
 		return false
 	}
-	if errContext := ctx.Err(); errContext != nil {
+	if stopped() {
 		return false
 	}
 	if !s.applyPprofConfigContext(ctx, cfg) {
 		return false
 	}
 	s.applyDiscoveryConfigContext(ctx, cfg)
+	if stopped() {
+		return false
+	}
 	if s.kvStoreManaged.Load() {
 		s.applyKVStoreConfig(cfg)
 	}
-	if errContext := ctx.Err(); errContext != nil {
+	if stopped() {
 		return false
 	}
 	if !s.updateServerClientsContext(ctx, cfg) {
 		return false
 	}
-	if errContext := ctx.Err(); errContext != nil {
+	if stopped() {
 		return false
 	}
 
 	registrationCtx := coreauth.WithSkipPersist(ctx)
 	s.syncPluginRuntimeConfigForConfig(registrationCtx, cfg)
-	if errContext := ctx.Err(); errContext != nil {
+	if stopped() {
 		return false
 	}
 	var auths []*coreauth.Auth
@@ -236,13 +271,13 @@ func (s *Service) applyConfigRuntime(ctx context.Context, commit configCommit, s
 		forceReplaceAuths: true,
 		auths:             auths,
 	})
-	if errContext := ctx.Err(); errContext != nil {
+	if stopped() {
 		return false
 	}
 	if synthesizeConfigAuths {
 		s.registerConfigAPIKeyAuths(registrationCtx, cfg)
 	}
-	if errContext := ctx.Err(); errContext != nil {
+	if stopped() {
 		return false
 	}
 	if s.coreManager != nil && !cfg.Home.Enabled && cfg.SaveCooldownStatus {
@@ -250,11 +285,11 @@ func (s *Service) applyConfigRuntime(ctx context.Context, commit configCommit, s
 			log.Warnf("failed to restore cooldown state after config update: %v", errRestoreCooldown)
 		}
 	}
-	if errContext := ctx.Err(); errContext != nil {
+	if stopped() {
 		return false
 	}
 	s.syncPluginModelRuntime(registrationCtx)
-	return ctx.Err() == nil
+	return !stopped()
 }
 
 func (s *Service) applyManagerConfig(ctx context.Context, commit configCommit) bool {
@@ -264,7 +299,7 @@ func (s *Service) applyManagerConfig(ctx context.Context, commit configCommit) b
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if errContext := ctx.Err(); errContext != nil {
+	if s.admissionStopped() || ctx.Err() != nil {
 		return false
 	}
 	routingState := normalizedRoutingRuntimeState(commit.cfg)
@@ -275,6 +310,9 @@ func (s *Service) applyManagerConfig(ctx context.Context, commit configCommit) b
 	s.applyRetryConfig(commit.cfg)
 	store := s.resolveCooldownStateStore(commit.cfg)
 	if !s.coreManager.ApplyConfigWithCooldownStateStore(ctx, commit.cfg, store) {
+		return false
+	}
+	if s.admissionStopped() || ctx.Err() != nil {
 		return false
 	}
 	s.coreManager.SetOAuthModelAlias(commit.cfg.OAuthModelAlias)

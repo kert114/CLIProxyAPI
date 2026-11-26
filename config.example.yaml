@@ -57,6 +57,12 @@ server:
   #   - 127.0.0.1
   #   - 192.0.2.0/24
 
+  # Graceful shutdown budget in seconds. A positive value makes the standalone
+  # proxy stop accepting API connections on SIGINT/SIGTERM and gives active HTTP
+  # requests time to finish. The process exits with an error if shutdown is still
+  # stuck two seconds after the budget expires. Default 0 keeps legacy shutdown.
+  shutdown-timeout: 0
+
   # TLS settings for HTTPS. When enabled, the server listens with the provided certificate and key.
   tls:
     enable: false

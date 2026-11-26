@@ -6,7 +6,11 @@ package cmd
 import (
 	"context"
 	"errors"
+	"fmt"
+	"math"
+	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -42,8 +46,12 @@ func StartServiceWithPluginHost(cfg *config.Config, configPath string, localPass
 		builder = builder.WithServerOptions(serverOptions...)
 	}
 
-	ctxSignal, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer cancel()
+	var initialBudget time.Duration
+	if cfg != nil {
+		initialBudget = config.ShutdownDuration(cfg.ShutdownTimeoutSeconds)
+	}
+	ctxSignal, publishService, finish := standaloneSignalContext(initialBudget)
+	defer finish()
 
 	runCtx := ctxSignal
 	if localPassword != "" {
@@ -61,10 +69,84 @@ func StartServiceWithPluginHost(cfg *config.Config, configPath string, localPass
 		return
 	}
 
+	publishService(service)
 	err = service.Run(runCtx)
 	if err != nil && !errors.Is(err, context.Canceled) {
 		log.Errorf("proxy service exited with error: %v", err)
 	}
+}
+
+const standaloneExitGrace = 2 * time.Second
+
+// standaloneSignalContext handles both legacy cancellation and the positive
+// shutdown budget. Keeping the Run context alive through the drain keeps its
+// workers available to serve admitted requests.
+func standaloneSignalContext(initialBudget time.Duration) (context.Context, func(*cliproxy.Service), func()) {
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	ctx, cancel := context.WithCancelCause(context.Background())
+	var service atomic.Pointer[cliproxy.Service]
+	ready := make(chan struct{})
+	exiting := make(chan struct{})
+	finished := make(chan struct{})
+	var shutdownPanic any
+	go func() {
+		defer close(finished)
+		select {
+		case <-ctx.Done():
+			return
+		case sig := <-signals:
+			cause := fmt.Errorf("%s signal received", sig)
+			current := service.Load()
+			budget := initialBudget
+			if current != nil {
+				budget = current.ShutdownTimeout()
+			}
+			if budget <= 0 {
+				cancel(cause)
+				return
+			}
+
+			// Arm the watchdog before any service work. A blocked log sink
+			// must never hold up the process exit.
+			watchdog := time.AfterFunc(min(budget, math.MaxInt64-standaloneExitGrace)+standaloneExitGrace, func() {
+				go fmt.Fprintln(os.Stderr, "proxy shutdown exceeded its deadline; forcing exit")
+				os.Exit(1)
+			})
+			defer watchdog.Stop()
+			if current == nil {
+				select {
+				case <-ready:
+					current = service.Load()
+				case <-exiting:
+					return
+				}
+			}
+			func() {
+				// Report a teardown panic to the Run caller through finish.
+				// Keep the watchdog armed until that caller unwinds.
+				defer func() { shutdownPanic = recover() }()
+				_ = current.ShutdownWithBudget(context.Background(), budget)
+			}()
+			cancel(cause)
+			<-exiting
+		}
+	}()
+
+	publish := func(s *cliproxy.Service) {
+		service.Store(s)
+		close(ready)
+	}
+	finish := func() {
+		cancel(nil)
+		signal.Stop(signals)
+		close(exiting)
+		<-finished
+		if shutdownPanic != nil {
+			panic(shutdownPanic)
+		}
+	}
+	return ctx, publish, finish
 }
 
 // StartServiceBackground starts the proxy service in a background goroutine

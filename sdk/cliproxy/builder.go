@@ -279,6 +279,8 @@ func (b *Builder) Build() (*Service, error) {
 
 	service := &Service{
 		cfg:                 b.cfg.CloneForRuntime(),
+		admissionClosed:     make(chan struct{}),
+		pprofServer:         newPprofServer(),
 		configPath:          b.configPath,
 		tokenProvider:       tokenProvider,
 		apiKeyProvider:      apiKeyProvider,
@@ -293,6 +295,7 @@ func (b *Builder) Build() (*Service, error) {
 		appliedRoutingState: appliedRoutingState,
 		serverOptions:       append([]api.ServerOption(nil), b.serverOptions...),
 	}
+	service.shutdownConfig.Store(service.cfg)
 	service.proxyPoolPublisher = helps.RegisterProxyPoolPublisher()
 	helps.AdvanceProxyPoolGeneration(service.proxyPoolPublisher, service.cfg)
 	if b.postAuthHook != nil {

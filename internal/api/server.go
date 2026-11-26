@@ -27,6 +27,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/managementasset"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/shutdown"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v8/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers/openai"
@@ -47,6 +48,9 @@ type Server struct {
 
 	// muxBaseListener is the shared TCP listener used to serve both HTTP and Redis protocol traffic.
 	listenerMu      sync.Mutex
+	listenerStopped bool
+	rawListener     net.Listener
+	connections     shutdown.Connections
 	muxBaseListener net.Listener
 
 	// muxHTTPListener receives HTTP connections selected by the multiplexer.
@@ -303,10 +307,14 @@ func (s *Server) Start() error {
 	}
 
 	addr := s.server.Addr
-	listener, errListen := net.Listen("tcp", addr)
+	raw, errListen := s.listen(addr)
 	if errListen != nil {
+		if errors.Is(errListen, net.ErrClosed) {
+			return nil
+		}
 		return fmt.Errorf("failed to start HTTP server: %v", errListen)
 	}
+	var listener net.Listener = trackingListener{Listener: raw, connections: &s.connections}
 
 	cfg := s.getConfig()
 	useTLS := cfg != nil && cfg.TLS.Enable
@@ -343,6 +351,11 @@ func (s *Server) Start() error {
 
 	httpListener := newMuxListener(listener.Addr(), 1024)
 	s.listenerMu.Lock()
+	if s.listenerStopped {
+		s.listenerMu.Unlock()
+		_ = raw.Close()
+		return nil
+	}
 	s.muxBaseListener = listener
 	s.muxHTTPListener = httpListener
 	s.listenerMu.Unlock()
@@ -411,14 +424,124 @@ func (s *Server) Start() error {
 	}
 }
 
-// Stop closes listeners and immediately shuts down the API server without waiting for active connections.
-//
-// Parameters:
-//   - ctx: Context passed for compatibility.
-//
-// Returns:
-//   - error: An error if the server fails to stop
+// listen publishes the listener before TLS setup or logging can block. A
+// service that starts at zero can enable draining before startup finishes.
+func (s *Server) listen(addr string) (net.Listener, error) {
+	tcpAddr, err := net.ResolveTCPAddr("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	s.listenerMu.Lock()
+	defer s.listenerMu.Unlock()
+	if s.listenerStopped {
+		return nil, net.ErrClosed
+	}
+	listener, err := net.ListenTCP("tcp", tcpAddr)
+	if err != nil {
+		return nil, err
+	}
+	s.rawListener = listener
+	return listener, nil
+}
+
+// StopAccepting permanently closes the raw TCP listener. It leaves admitted
+// requests and upgraded connections alive for Drain.
+func (s *Server) StopAccepting() {
+	s.listenerMu.Lock()
+	defer s.listenerMu.Unlock()
+	if s.listenerStopped {
+		return
+	}
+	s.listenerStopped = true
+	if s.muxHTTPListener != nil {
+		s.muxHTTPListener.interrupt.Store(true)
+	}
+	if s.rawListener != nil {
+		_ = s.rawListener.Close()
+	} else if s.muxBaseListener != nil {
+		_ = s.muxBaseListener.Close()
+	}
+}
+
+// Stop closes listeners and shuts down the API server.
 func (s *Server) Stop(ctx context.Context) error {
+	if cfg := s.getConfig(); cfg != nil && cfg.ShutdownTimeoutSeconds > 0 {
+		return s.StopWithDrainTimeout(ctx, cfg.ShutdownTimeoutSeconds)
+	}
+	return s.stopLegacy()
+}
+
+func (s *Server) StopWithDrainTimeout(ctx context.Context, seconds int) error {
+	if seconds <= 0 {
+		return s.stopLegacy()
+	}
+	s.StopAccepting()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	budget := config.ShutdownDuration(seconds)
+	drainCtx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < budget {
+		shutdown.RunDetached(func() { log.Warn("HTTP drain limited by shutdown context deadline") })
+	}
+	return s.Drain(drainCtx)
+}
+
+// Drain finishes admitted HTTP requests within ctx. StopAccepting must run first.
+func (s *Server) Drain(ctx context.Context) error {
+	if s.keepAliveEnabled {
+		select {
+		case s.keepAliveStop <- struct{}{}:
+		default:
+		}
+	}
+	s.listenerMu.Lock()
+	muxHTTP := s.muxHTTPListener
+	s.listenerMu.Unlock()
+	// net/http can wait for a TLS close alert even on an idle connection.
+	// Its shutdown context doesn't interrupt a Close already in progress.
+	interrupted := make(chan struct{})
+	stopInterrupt := context.AfterFunc(ctx, func() {
+		s.connections.Close()
+		close(interrupted)
+	})
+	if muxHTTP != nil {
+		_ = muxHTTP.Close()
+	}
+	var errShutdown error
+	if s.server != nil {
+		errShutdown = s.server.Shutdown(ctx)
+	}
+	if stopInterrupt() {
+		// Also includes sockets still sniffing and connections transferred
+		// to WebSocket or RESP handlers outside http.Server's ownership.
+		s.connections.Close()
+	} else {
+		<-interrupted
+	}
+	if s.server != nil {
+		if errClose := s.server.Close(); errClose != nil && !errors.Is(errClose, http.ErrServerClosed) && !errors.Is(errClose, net.ErrClosed) && errShutdown == nil {
+			errShutdown = errClose
+		}
+	}
+	if errors.Is(errShutdown, context.DeadlineExceeded) || errors.Is(errShutdown, context.Canceled) {
+		errDrain := errShutdown
+		shutdown.RunDetached(func() {
+			log.WithError(errDrain).Warn("HTTP drain ended before all requests finished, closing remaining connections")
+		})
+		errShutdown = nil
+	}
+	if s.codexLiveHandler != nil {
+		s.codexLiveHandler.Close()
+	}
+	if errShutdown != nil {
+		return fmt.Errorf("failed to shutdown HTTP server: %w", errShutdown)
+	}
+	return nil
+}
+
+func (s *Server) stopLegacy() error {
 	log.Debug("Stopping API server...")
 
 	if s.keepAliveEnabled {

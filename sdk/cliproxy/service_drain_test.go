@@ -1,0 +1,270 @@
+package cliproxy
+
+import (
+	"bufio"
+	"context"
+	"errors"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"sync"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/api"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/wsrelay"
+)
+
+func TestServiceShutdown_DrainsRelayBackedStream(t *testing.T) {
+	connected := make(chan struct{})
+	relay := wsrelay.NewManager(wsrelay.Options{
+		ProviderFactory: func(*http.Request) (string, error) { return "fixture", nil },
+		OnConnected:     func(string) { close(connected) },
+	})
+	service, addr, serving := startDrainTestService(t, api.WithEngineConfigurator(func(engine *gin.Engine) {
+		engine.GET(relay.Path(), gin.WrapH(relay.Handler()))
+		engine.GET("/relay-stream", func(c *gin.Context) {
+			events, errStream := relay.Stream(c.Request.Context(), "fixture", &wsrelay.HTTPRequest{
+				Method: http.MethodGet,
+				URL:    "http://fixture.test/stream",
+			})
+			if errStream != nil {
+				c.String(http.StatusBadGateway, "%v", errStream)
+				return
+			}
+			for event := range events {
+				if event.Err != nil {
+					_, _ = io.WriteString(c.Writer, event.Err.Error())
+					return
+				}
+				if event.Type == wsrelay.MessageTypeStreamChunk {
+					_, _ = c.Writer.Write(event.Payload)
+					c.Writer.Flush()
+				}
+			}
+		})
+	}))
+	service.wsGateway = relay
+	dialer := websocket.Dialer{HandshakeTimeout: 3 * time.Second}
+	peer, _, errDial := dialer.Dial("ws://"+addr+relay.Path(), nil)
+	if errDial != nil {
+		t.Fatal(errDial)
+	}
+	defer func() { _ = peer.Close() }()
+	select {
+	case <-connected:
+	case <-time.After(time.Second):
+		t.Fatal("relay session was not registered")
+	}
+	_ = peer.SetReadDeadline(time.Now().Add(10 * time.Second))
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	type response struct {
+		resp *http.Response
+		err  error
+	}
+	responses := make(chan response, 1)
+	go func() {
+		resp, errGet := client.Get("http://" + addr + "/relay-stream")
+		responses <- response{resp, errGet}
+	}()
+
+	var request wsrelay.Message
+	if errRead := peer.ReadJSON(&request); errRead != nil {
+		t.Fatal(errRead)
+	}
+	send := func(kind string, payload map[string]any) error {
+		return peer.WriteJSON(wsrelay.Message{ID: request.ID, Type: kind, Payload: payload})
+	}
+	if errSend := send(wsrelay.MessageTypeStreamChunk, map[string]any{"data": "first\n"}); errSend != nil {
+		t.Fatal(errSend)
+	}
+	result := <-responses
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	defer func() { _ = result.resp.Body.Close() }()
+	body := bufio.NewReader(result.resp.Body)
+	if first, errRead := body.ReadString('\n'); first != "first\n" || errRead != nil {
+		t.Fatalf("first relay chunk = %q, err = %v", first, errRead)
+	}
+
+	shutdown := make(chan error, 1)
+	go func() { shutdown <- service.Shutdown(context.Background()) }()
+	select {
+	case errServe := <-serving:
+		if errServe != nil {
+			t.Fatal(errServe)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("proxy listener did not close")
+	}
+
+	errChunk := send(wsrelay.MessageTypeStreamChunk, map[string]any{"data": "final\n"})
+	errEnd := send(wsrelay.MessageTypeStreamEnd, nil)
+	remaining, errRead := io.ReadAll(body)
+	if string(remaining) != "final\n" || errRead != nil || errChunk != nil || errEnd != nil {
+		t.Fatalf("stream after listener closed = %q, read error = %v, relay write errors = %v / %v", remaining, errRead, errChunk, errEnd)
+	}
+	if errStop := <-shutdown; errStop != nil {
+		t.Fatal(errStop)
+	}
+}
+
+func startDrainTestService(t *testing.T, options ...api.ServerOption) (*Service, string, <-chan error) {
+	return startDrainTestServiceWithTimeout(t, 5, options...)
+}
+
+func startDrainTestServiceWithTimeout(t *testing.T, timeout int, options ...api.ServerOption) (*Service, string, <-chan error) {
+	t.Helper()
+	listener, errListen := net.Listen("tcp", "127.0.0.1:0")
+	if errListen != nil {
+		t.Fatal(errListen)
+	}
+	addr := listener.Addr().String()
+	cfg := &config.Config{
+		Host:                   "127.0.0.1",
+		Port:                   listener.Addr().(*net.TCPAddr).Port,
+		AuthDir:                t.TempDir(),
+		ShutdownTimeoutSeconds: timeout,
+	}
+	if errClose := listener.Close(); errClose != nil {
+		t.Fatal(errClose)
+	}
+	server := api.NewServer(cfg, nil, nil, filepath.Join(cfg.AuthDir, "fixture.yaml"), options...)
+	service := &Service{cfg: cfg, server: server}
+	t.Cleanup(func() {
+		if errStop := service.Shutdown(context.Background()); errStop != nil {
+			t.Error(errStop)
+		}
+	})
+	serving := make(chan error, 1)
+	go func() { serving <- server.Start() }()
+
+	dialer := net.Dialer{}
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		conn, errDial := dialer.DialContext(ctx, "tcp", addr)
+		if errDial == nil {
+			_ = conn.Close()
+			return service, addr, serving
+		}
+		select {
+		case errStart := <-serving:
+			t.Fatalf("proxy stopped before listening: %v", errStart)
+		case <-ctx.Done():
+			t.Fatalf("proxy did not start listening: %v", errDial)
+		case <-ticker.C:
+		}
+	}
+}
+
+func TestServiceShutdown_ClosesProxyListenerBeforeWaitingForProfile(t *testing.T) {
+	service, addr, _ := startDrainTestService(t)
+	profileActive := make(chan struct{})
+	releaseProfile := make(chan struct{})
+	release := sync.OnceFunc(func() { close(releaseProfile) })
+	profile := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(profileActive)
+		<-releaseProfile
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer profile.Close()
+	defer release()
+	profileStopping := make(chan struct{})
+	profile.Config.RegisterOnShutdown(func() { close(profileStopping) })
+	service.pprofServer = &pprofServer{server: profile.Config, addr: profile.Listener.Addr().String(), enabled: true}
+
+	go func() {
+		resp, errGet := profile.Client().Get(profile.URL + "/debug/pprof/goroutine")
+		if errGet == nil {
+			_ = resp.Body.Close()
+		}
+	}()
+	select {
+	case <-profileActive:
+	case <-time.After(3 * time.Second):
+		t.Fatal("profiling request did not start")
+	}
+	shutdown := make(chan error, 1)
+	go func() { shutdown <- service.Shutdown(context.Background()) }()
+	select {
+	case <-profileStopping:
+	case <-time.After(3 * time.Second):
+		t.Fatal("profiling listener did not start shutdown")
+	}
+
+	conn, errDial := net.DialTimeout("tcp", addr, time.Second)
+	if conn != nil {
+		_ = conn.Close()
+	}
+	if !errors.Is(errDial, syscall.ECONNREFUSED) {
+		t.Fatalf("TCP dial while profiling request is active = %v, want connection refused", errDial)
+	}
+	select {
+	case errStop := <-shutdown:
+		t.Fatalf("shutdown returned before profiling request completed: %v", errStop)
+	default:
+	}
+	release()
+	if errStop := <-shutdown; errStop != nil {
+		t.Fatal(errStop)
+	}
+}
+
+func TestServiceShutdown_ZeroTimeoutKeepsAPIUntilPprofGraceEnds(t *testing.T) {
+	service, addr, _ := startDrainTestServiceWithTimeout(t, 0)
+	active, release := make(chan struct{}), make(chan struct{})
+	profile := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(active)
+		<-release
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer profile.Close()
+	finish := sync.OnceFunc(func() { close(release) })
+	defer finish()
+	stopping := make(chan struct{})
+	profile.Config.RegisterOnShutdown(func() { close(stopping) })
+	service.pprofServer = &pprofServer{server: profile.Config, addr: profile.Listener.Addr().String()}
+	go func() {
+		if resp, err := profile.Client().Get(profile.URL); err == nil {
+			_ = resp.Body.Close()
+		}
+	}()
+	select {
+	case <-active:
+	case <-time.After(time.Second):
+		t.Fatal("profiling request did not start")
+	}
+
+	stopped := make(chan error, 1)
+	go func() { stopped <- service.Shutdown(context.Background()) }()
+	select {
+	case <-stopping:
+	case <-time.After(time.Second):
+		t.Fatal("pprof shutdown did not start")
+	}
+	client := &http.Client{Timeout: time.Second}
+	res, err := client.Get("http://" + addr + "/healthz")
+	if err != nil {
+		t.Errorf("health check while pprof drained: %v", err)
+	} else {
+		_ = res.Body.Close()
+		if res.StatusCode != http.StatusOK {
+			t.Errorf("health check while pprof drained: %s", res.Status)
+		}
+	}
+	finish()
+	if err := <-stopped; err != nil {
+		t.Fatal(err)
+	}
+}

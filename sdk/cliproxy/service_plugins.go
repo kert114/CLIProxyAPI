@@ -352,7 +352,7 @@ func (s *Service) registerModelRefreshCallback() {
 	// This intentionally rebuilds per-auth model availability from the latest catalog
 	// snapshot instead of preserving prior registry suppression state.
 	registry.SetModelRefreshCallback(func(changedProviders []string) {
-		if s == nil || s.coreManager == nil || len(changedProviders) == 0 {
+		if s == nil || s.admissionStopped() || s.coreManager == nil || len(changedProviders) == 0 {
 			return
 		}
 
@@ -392,7 +392,7 @@ func (s *Service) registerModelRefreshCallback() {
 				phase:    modelRegistrationPhase(authForRefresh),
 				category: modelRegistrationCategory(authForRefresh),
 				run: func(compatCache *openAICompatibilityRegistrationCache) {
-					if s.refreshModelRegistrationForAuthWithCache(authForRefresh, compatCache) {
+					if !s.admissionStopped() && s.refreshModelRegistrationForAuthWithCache(authForRefresh, compatCache) {
 						refreshedMu.Lock()
 						refreshed++
 						refreshedMu.Unlock()

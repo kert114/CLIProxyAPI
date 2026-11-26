@@ -3,17 +3,21 @@ package api
 import (
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/shutdown"
 )
 
 type muxListener struct {
-	addr     net.Addr
-	connCh   chan net.Conn
-	closeCh  chan struct{}
-	closed   bool
-	mu       sync.Mutex
-	inFlight sync.WaitGroup
-	once     sync.Once
+	addr      net.Addr
+	connCh    chan net.Conn
+	closeCh   chan struct{}
+	closed    bool
+	mu        sync.Mutex
+	inFlight  sync.WaitGroup
+	once      sync.Once
+	interrupt atomic.Bool
 }
 
 func newMuxListener(addr net.Addr, buffer int) *muxListener {
@@ -96,7 +100,7 @@ func (l *muxListener) Accept() (net.Conn, error) {
 		}
 		select {
 		case <-l.closeCh:
-			_ = conn.Close()
+			l.closeConn(conn)
 			return nil, net.ErrClosed
 		default:
 			return conn, nil
@@ -122,7 +126,7 @@ func (l *muxListener) Close() error {
 			select {
 			case conn := <-l.connCh:
 				if conn != nil {
-					_ = conn.Close()
+					l.closeConn(conn)
 				}
 			default:
 				return
@@ -140,4 +144,27 @@ func (l *muxListener) Addr() net.Addr {
 		return &net.TCPAddr{}
 	}
 	return l.addr
+}
+
+func (l *muxListener) closeConn(conn net.Conn) {
+	if l.interrupt.Load() {
+		_ = shutdown.CloseTransport(conn)
+	} else {
+		_ = conn.Close()
+	}
+}
+
+// trackingListener tracks native TCP below TLS so only owned sockets are
+// interrupted at the end of a drain. It also covers sniffers and upgrades.
+type trackingListener struct {
+	net.Listener
+	connections *shutdown.Connections
+}
+
+func (l trackingListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return l.connections.Track(conn)
 }

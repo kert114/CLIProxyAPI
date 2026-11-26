@@ -37,6 +37,11 @@ func (s *Service) ensureAuthUpdateQueue(ctx context.Context) {
 	if s == nil {
 		return
 	}
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+	if s.admissionStopped() {
+		return
+	}
 	if s.authUpdates == nil {
 		s.authUpdates = make(chan watcher.AuthUpdate, 256)
 	}

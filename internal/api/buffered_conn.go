@@ -40,3 +40,5 @@ func (c *bufferedConn) CloseWrite() error {
 	}
 	return nil
 }
+
+func (c *bufferedConn) NetConn() net.Conn { return c.Conn }
