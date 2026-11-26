@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
@@ -246,6 +247,87 @@ func TestResetFirstUnparsedProviderIgnoresSubagentOnly(t *testing.T) {
 		}
 		if got.ID != want {
 			t.Fatalf("pick %d = %q, want %q", i, got.ID, want)
+		}
+	}
+}
+
+// authIDStreamExecutor streams the selected auth ID so tests can see which credential ran.
+type authIDStreamExecutor struct{ mockCustomErrorExecutor }
+
+func (e *authIDStreamExecutor) ExecuteStream(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	chunks := make(chan cliproxyexecutor.StreamChunk, 1)
+	chunks <- cliproxyexecutor.StreamChunk{Payload: []byte(auth.ID)}
+	close(chunks)
+	return &cliproxyexecutor.StreamResult{Chunks: chunks}, nil
+}
+
+func TestResetFirstManagerStreamKeepsCodexWebsocketPreference(t *testing.T) {
+	const model = "reset-ws-codex"
+	now := time.Now()
+	ws := codexResetAuth("reset-ws-enabled", now, nil, map[string]codexWindow{
+		"Primary": {minutes: weekMinutes, resetAt: now.Add(24 * time.Hour)},
+	})
+	ws.Attributes = map[string]string{"websockets": "true"}
+	httpOnly := codexResetAuth("reset-ws-http", now, nil, map[string]codexWindow{
+		"Primary": {minutes: weekMinutes, resetAt: now.Add(15 * time.Hour)},
+	})
+	for name, selector := range map[string]Selector{
+		"reset-first":           &ResetFirstSelector{},
+		"with session affinity": NewSessionAffinitySelector(&ResetFirstSelector{}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if affinity, ok := selector.(*SessionAffinitySelector); ok {
+				t.Cleanup(affinity.Stop)
+			}
+			manager := NewManager(nil, selector, nil)
+			manager.RegisterExecutor(&authIDStreamExecutor{mockCustomErrorExecutor{identifier: "codex"}})
+			for _, candidate := range []*Auth{httpOnly.Clone(), ws.Clone()} {
+				registry.GetGlobalRegistry().RegisterClient(candidate.ID, "codex", []*registry.ModelInfo{{ID: model}})
+				t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(candidate.ID) })
+				if _, err := manager.Register(context.Background(), candidate); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
+			result, err := manager.ExecuteStream(ctx, []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got string
+			for chunk := range result.Chunks {
+				got += string(chunk.Payload)
+			}
+			if got != "reset-ws-enabled" {
+				t.Fatalf("stream used %q, want reset-ws-enabled", got)
+			}
+		})
+	}
+}
+
+func TestResetFirstCodexDailyWindowIsShortWindow(t *testing.T) {
+	now := time.Now()
+	const dayMinutes = 24 * 60
+	busy := codexResetAuth("busy", now, nil, map[string]codexWindow{
+		"Primary":   {minutes: dayMinutes, usedPct: "85", resetAt: now.Add(6 * time.Hour)},
+		"Secondary": {minutes: weekMinutes, resetAt: now.Add(24 * time.Hour)},
+	})
+	idle := codexResetAuth("idle", now, nil, map[string]codexWindow{
+		"Primary":   {minutes: dayMinutes, usedPct: "10", resetAt: now.Add(6 * time.Hour)},
+		"Secondary": {minutes: weekMinutes, resetAt: now.Add(72 * time.Hour)},
+	})
+	if got := pickCodex(t, &ResetFirstSelector{}, cliproxyexecutor.Options{}, []*Auth{busy, idle}); got != "idle" {
+		t.Fatalf("picked %q, want idle (busy is at 85%% of its daily window)", got)
+	}
+	dailyOnly := codexResetAuth("daily-only", now, nil, map[string]codexWindow{
+		"Primary": {minutes: dayMinutes, usedPct: "10", resetAt: now.Add(2 * time.Hour)},
+	})
+	weekly := codexResetAuth("weekly", now, nil, map[string]codexWindow{
+		"Primary": {minutes: weekMinutes, resetAt: now.Add(24 * time.Hour)},
+	})
+	selector := &ResetFirstSelector{}
+	for i, want := range []string{"daily-only", "weekly", "daily-only"} {
+		if got := pickCodex(t, selector, cliproxyexecutor.Options{}, []*Auth{dailyOnly, weekly}); got != want {
+			t.Fatalf("pick %d = %q, want %q (a daily window must not stand in for a weekly reset)", i, got, want)
 		}
 	}
 }

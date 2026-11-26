@@ -51,7 +51,7 @@ func (s *ResetFirstSelector) Pick(ctx context.Context, provider, model string, o
 			return s.fallback.Pick(ctx, provider, model, opts, available)
 		}
 	}
-	available = preferCodexWebsocketAuths(ctx, provider, available)
+	available = preferCodexWebsocketAuths(ctx, poolProvider(provider, available), available)
 	full, _ := opts.Metadata[subagentFullAuthsMetadataKey].(map[string]bool)
 	available = resetFirstCandidates(available, isSubagentRequest(opts), full, now)
 	var selected *Auth
@@ -136,4 +136,20 @@ func isSubagentRequest(opts cliproxyexecutor.Options) bool {
 
 func hasSubagentRoleHeader(headers http.Header) bool {
 	return strings.EqualFold(strings.TrimSpace(headers.Get(SessionRoleHeader)), "subagent")
+}
+
+// poolProvider returns the single provider behind a "mixed" pool, so provider-specific
+// preferences such as the Codex websocket transport still apply when only one provider
+// is configured. Pools with several providers keep "mixed".
+func poolProvider(provider string, auths []*Auth) string {
+	if provider != "mixed" || len(auths) == 0 {
+		return provider
+	}
+	only := strings.ToLower(strings.TrimSpace(auths[0].Provider))
+	for _, candidate := range auths[1:] {
+		if !strings.EqualFold(strings.TrimSpace(candidate.Provider), only) {
+			return provider
+		}
+	}
+	return only
 }

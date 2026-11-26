@@ -65,13 +65,13 @@ func claudeQuotaWindows(signals map[string]string, now time.Time) quotaWindows {
 }
 
 // codexLongWindowMinutes is the shortest Codex window treated as the long (weekly)
-// window. Shorter windows, such as the five-hour window, only feed the headroom guard.
-const codexLongWindowMinutes = 24 * 60
+// window. Shorter windows, such as five-hour or daily windows, only feed the headroom guard.
+const codexLongWindowMinutes = 7 * 24 * 60
 
 // codexQuotaWindows reads the base X-Codex-Primary-* and X-Codex-Secondary-*
 // windows. Their names and lengths vary by plan (a Pro plan may report only a weekly
 // window), so windows are classified by Window-Minutes: the longest window of at least
-// one day orders accounts, and the shortest window under one day feeds the
+// one week orders accounts, and the shortest window under one week feeds the
 // short-window guard. Namespaced additional limits are ignored.
 func codexQuotaWindows(quota QuotaState, now time.Time) quotaWindows {
 	var windows quotaWindows
