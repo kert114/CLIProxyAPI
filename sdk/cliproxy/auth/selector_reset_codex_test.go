@@ -87,7 +87,7 @@ func TestResetFirstCodexTwoWindowsUsesLongestForOrderAndShortForGuard(t *testing
 		"Primary":   {minutes: 300, usedPct: "85", resetAt: now.Add(4 * time.Hour)},
 		"Secondary": {minutes: weekMinutes, usedPct: "50", resetAt: now.Add(24 * time.Hour)},
 	})
-	if got := pickCodex(t, selector, cliproxyexecutor.Options{}, []*Auth{late, early}); got != "late" {
+	if got := pickCodex(t, &ResetFirstSelector{}, cliproxyexecutor.Options{}, []*Auth{late, early}); got != "late" {
 		t.Fatalf("picked %q, want late (early is at 85%% of its five-hour window)", got)
 	}
 }
@@ -181,5 +181,71 @@ func TestResetFirstDevinUsesWeeklyThenDailyGuard(t *testing.T) {
 	got, err = (&ResetFirstSelector{}).Pick(context.Background(), "devin", "swe", cliproxyexecutor.Options{}, []*Auth{devin("late", 72*time.Hour, "90%"), devin("early", 24*time.Hour, "10%")})
 	if err != nil || got.ID != "late" {
 		t.Fatalf("picked %v (err %v), want late (early has 10%% of its daily quota left)", got, err)
+	}
+}
+
+func TestResetFirstCodexFiveHourOnlySnapshotIsShortWindow(t *testing.T) {
+	now := time.Now()
+	weekly := codexResetAuth("weekly", now, nil, map[string]codexWindow{
+		"Primary": {minutes: weekMinutes, usedPct: "10", resetAt: now.Add(24 * time.Hour)},
+	})
+	busy := codexResetAuth("busy", now, nil, map[string]codexWindow{
+		"Primary": {minutes: 300, usedPct: "85", resetAt: now.Add(time.Hour)},
+	})
+	selector := &ResetFirstSelector{}
+	for i := 0; i < 3; i++ {
+		if got := pickCodex(t, selector, cliproxyexecutor.Options{}, []*Auth{busy, weekly}); got != "weekly" {
+			t.Fatalf("pick %d = %q, want weekly (busy is at 85%% of a five-hour window)", i, got)
+		}
+	}
+}
+
+func TestResetFirstCodexKeepsWebsocketPreference(t *testing.T) {
+	now := time.Now()
+	ws := codexResetAuth("ws", now, nil, map[string]codexWindow{
+		"Primary": {minutes: weekMinutes, resetAt: now.Add(24 * time.Hour)},
+	})
+	ws.Attributes = map[string]string{"websockets": "true"}
+	httpOnly := codexResetAuth("http", now, nil, map[string]codexWindow{
+		"Primary": {minutes: weekMinutes, resetAt: now.Add(15 * time.Hour)},
+	})
+	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
+	got, err := (&ResetFirstSelector{}).Pick(ctx, "codex", "gpt-5", cliproxyexecutor.Options{}, []*Auth{httpOnly, ws})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != "ws" {
+		t.Fatalf("picked %q, want ws (downstream websocket prefers websocket credentials)", got.ID)
+	}
+}
+
+func TestResetFirstPoolWithUnparsedProviderKeepsRoundRobin(t *testing.T) {
+	now := time.Now()
+	claude := guardTestAuth("claude", now.Add(24*time.Hour), "0.85", now.Add(time.Hour), false)
+	gemini := &Auth{ID: "gemini", Provider: "gemini"}
+	selector := &ResetFirstSelector{}
+	for i, want := range []string{"claude", "gemini", "claude", "gemini"} {
+		got, err := selector.Pick(context.Background(), "mixed", "shared-alias", cliproxyexecutor.Options{}, []*Auth{claude, gemini})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.ID != want {
+			t.Fatalf("pick %d = %q, want %q", i, got.ID, want)
+		}
+	}
+}
+
+func TestResetFirstUnparsedProviderIgnoresSubagentOnly(t *testing.T) {
+	reserved := &Auth{ID: "a", Provider: "gemini", Metadata: map[string]any{"subagent_only": true}}
+	other := &Auth{ID: "b", Provider: "gemini"}
+	selector := &ResetFirstSelector{}
+	for i, want := range []string{"a", "b", "a"} {
+		got, err := selector.Pick(context.Background(), "gemini", "gemini-pro", cliproxyexecutor.Options{}, []*Auth{reserved, other})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.ID != want {
+			t.Fatalf("pick %d = %q, want %q", i, got.ID, want)
+		}
 	}
 }

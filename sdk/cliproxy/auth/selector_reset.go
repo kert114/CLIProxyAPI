@@ -27,7 +27,8 @@ const (
 // account's last observed quota windows through observedQuotaWindows, so any
 // provider with a window parser takes part. Accounts whose weekly reset is unknown,
 // including providers without a parser, use round-robin so every account can acquire
-// a snapshot through normal requests.
+// a snapshot through normal requests. Pools that include a provider without a parser
+// keep plain round-robin.
 // Before ordering, subagent_only accounts are reserved for subagent requests and
 // accounts near their short-window limit are skipped while a peer has headroom.
 // Wrap it in SessionAffinitySelector to keep existing conversations on their account.
@@ -37,11 +38,20 @@ type ResetFirstSelector struct {
 
 func (s *ResetFirstSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	provider = strings.ToLower(strings.TrimSpace(provider))
+	if provider != "mixed" && !supportsQuotaWindows(provider) {
+		return s.fallback.Pick(ctx, provider, model, opts, auths)
+	}
 	now := time.Now()
 	available, err := getSelectorAvailableAuths(ctx, auths, provider, model, now)
 	if err != nil {
 		return nil, err
 	}
+	for _, candidate := range available {
+		if !supportsQuotaWindows(candidate.Provider) {
+			return s.fallback.Pick(ctx, provider, model, opts, available)
+		}
+	}
+	available = preferCodexWebsocketAuths(ctx, provider, available)
 	full, _ := opts.Metadata[subagentFullAuthsMetadataKey].(map[string]bool)
 	available = resetFirstCandidates(available, isSubagentRequest(opts), full, now)
 	var selected *Auth

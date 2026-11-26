@@ -8,6 +8,17 @@ import (
 	"time"
 )
 
+// supportsQuotaWindows reports whether observedQuotaWindows has a parser for the provider.
+// Keep it in sync with the cases in observedQuotaWindows.
+func supportsQuotaWindows(provider string) bool {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "claude", "codex", "devin":
+		return true
+	default:
+		return false
+	}
+}
+
 // quotaWindows is the provider-neutral view of an account's last observed
 // subscription windows. Zero times mean the window is unknown or already reset.
 type quotaWindows struct {
@@ -53,17 +64,18 @@ func claudeQuotaWindows(signals map[string]string, now time.Time) quotaWindows {
 	return windows
 }
 
+// codexLongWindowMinutes is the shortest Codex window treated as the long (weekly)
+// window. Shorter windows, such as the five-hour window, only feed the headroom guard.
+const codexLongWindowMinutes = 24 * 60
+
 // codexQuotaWindows reads the base X-Codex-Primary-* and X-Codex-Secondary-*
-// windows. Their lengths vary by plan (a Pro plan may report only a weekly window),
-// so the longest Window-Minutes value orders accounts and a shorter one feeds the
+// windows. Their names and lengths vary by plan (a Pro plan may report only a weekly
+// window), so windows are classified by Window-Minutes: the longest window of at least
+// one day orders accounts, and the shortest window under one day feeds the
 // short-window guard. Namespaced additional limits are ignored.
 func codexQuotaWindows(quota QuotaState, now time.Time) quotaWindows {
-	type window struct {
-		minutes int64
-		reset   time.Time
-		used    float64
-	}
-	var observed []window
+	var windows quotaWindows
+	var longMinutes, shortMinutes int64
 	for _, name := range []string{"Primary", "Secondary"} {
 		header := func(suffix string) string {
 			return strings.TrimSpace(quota.Signals[http.CanonicalHeaderKey("X-Codex-"+name+"-"+suffix)])
@@ -78,25 +90,19 @@ func codexQuotaWindows(quota QuotaState, now time.Time) quotaWindows {
 				reset = quota.ObservedAt.Add(time.Duration(seconds) * time.Second)
 			}
 		}
-		observed = append(observed, window{minutes: minutes, reset: futureTime(reset, now), used: parseFraction(header("Used-Percent"), 100)})
-	}
-	var windows quotaWindows
-	var long, short *window
-	for i := range observed {
-		if long == nil || observed[i].minutes > long.minutes {
-			long = &observed[i]
+		reset = futureTime(reset, now)
+		if minutes >= codexLongWindowMinutes {
+			if minutes > longMinutes {
+				longMinutes, windows.longReset = minutes, reset
+			}
+			continue
 		}
-	}
-	for i := range observed {
-		if &observed[i] != long && observed[i].minutes < long.minutes {
-			short = &observed[i]
+		if shortMinutes == 0 || minutes < shortMinutes {
+			shortMinutes, windows.shortReset, windows.shortUsed = minutes, reset, 0
+			if !reset.IsZero() {
+				windows.shortUsed = parseFraction(header("Used-Percent"), 100)
+			}
 		}
-	}
-	if long != nil {
-		windows.longReset = long.reset
-	}
-	if short != nil && !short.reset.IsZero() {
-		windows.shortReset, windows.shortUsed = short.reset, short.used
 	}
 	return windows
 }
