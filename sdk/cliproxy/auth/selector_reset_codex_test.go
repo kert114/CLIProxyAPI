@@ -289,16 +289,19 @@ func TestResetFirstManagerStreamKeepsCodexWebsocketPreference(t *testing.T) {
 				}
 			}
 			ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
-			result, err := manager.ExecuteStream(ctx, []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
-			if err != nil {
-				t.Fatal(err)
-			}
-			var got string
-			for chunk := range result.Chunks {
-				got += string(chunk.Payload)
-			}
-			if got != "reset-ws-enabled" {
-				t.Fatalf("stream used %q, want reset-ws-enabled", got)
+			opts := cliproxyexecutor.Options{Headers: http.Header{"Session_id": {"codex-ws-session"}}}
+			for i := 0; i < 2; i++ {
+				result, err := manager.ExecuteStream(ctx, []string{"codex"}, cliproxyexecutor.Request{Model: model}, opts)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var got string
+				for chunk := range result.Chunks {
+					got += string(chunk.Payload)
+				}
+				if got != "reset-ws-enabled" {
+					t.Fatalf("request %d streamed with %q, want reset-ws-enabled", i, got)
+				}
 			}
 		})
 	}
